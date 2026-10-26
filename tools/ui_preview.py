@@ -40,7 +40,7 @@ MC_Y, MC_H = 143, 64
 GRF_X, GRF_Y, GRF_W, GRF_H = 176, 32, 140, 175
 PLOT_X, PLOT_Y, PLOT_W, PLOT_H = 184, 50, 126, 151
 DIG_Y, DIG_W, DIG_H, DIG_TH = 46, 22, 38, 6
-SETUP_TOP, SETUP_RH = 32, 34
+SETUP_TOP, SETUP_RH, SETUP_RH_H, SETUP_ROWS = 32, 27, 27, 6
 
 PAGE_HOME, PAGE_SETUP, PAGE_ABOUT = 0, 1, 2
 
@@ -277,15 +277,18 @@ def home_set_block(s, sp10, selected):
              UI_GOLD if selected else UI_TEXT, bg, 2)
 
 
-def home_meter(s, idx, pct, selected):
+def home_meter(s, idx, pct, selected, muted=False):
     names = ["HEAT", "IRON", "FAN", "FAN2"]
     cols = [UI_GREEN, UI_ORANGE, UI_BLUE, UI_BLUE]
     y = 145 + idx * 16
     bg = UI_SEL if selected else UI_CARD
     s.rrect(9, y - 1, 158, 15, bg)
     s.text(13, y, names[idx], UI_GOLD if selected else UI_MUTED, bg, 1)
-    s.text_r(163, y, "%3d%%" % pct, UI_GOLD if selected else UI_TEXT, bg, 1)
-    meter_bar(s, 13, y + 9, 150, 4, pct, cols[idx])
+    if muted:
+        s.text_r(163, y, "MUTE", UI_RED, bg, 1)
+    else:
+        s.text_r(163, y, "%3d%%" % pct, UI_GOLD if selected else UI_TEXT, bg, 1)
+    meter_bar(s, 13, y + 9, 150, 4, 0 if muted else pct, cols[idx])
 
 
 def draw_graph(s, hist, sp10):
@@ -341,27 +344,28 @@ def page_home(s, hist, t10, sp10, heat, iron, fan, fan2, st, selrow):
     draw_graph(s, hist, sp10)
 
 
-SET_LABEL = ["HEATER", "FAN MODE", "KP", "KI", "KD"]
+SET_LABEL = ["HEATER", "FAN MODE", "BOX FAN", "KP", "KI", "KD"]
 
 
 def setup_row(s, i, values, selected):
     y = SETUP_TOP + i * SETUP_RH
     bg = UI_SEL if selected else UI_CARD
-    s.panel(6, y, 310, 32, bg, UI_GOLD if selected else UI_EDGE)
-    s.text(16, y + 5, SET_LABEL[i], UI_GOLD if selected else UI_MUTED, bg, 1)
-    s.text(16, y + 15, values[i], UI_GOLD if selected else UI_TEXT, bg, 2)
+    s.panel(6, y, 310, SETUP_RH_H, bg, UI_GOLD if selected else UI_EDGE)
+    s.text(16, y + 4, SET_LABEL[i], UI_GOLD if selected else UI_MUTED, bg, 1)
+    col = UI_RED if (i == 2 and values[2] == "MUTE") else (UI_GOLD if selected else UI_TEXT)
+    s.text(16, y + 11, values[i], col, bg, 2)
     if selected:
-        s.tri(282, y + 11, 6, 10, UI_GOLD, -1)
-        s.tri(298, y + 11, 6, 10, UI_GOLD, +1)
+        s.tri(282, y + 8, 6, 10, UI_GOLD, -1)
+        s.tri(298, y + 8, 6, 10, UI_GOLD, +1)
 
 
 def page_setup(s, values, st, selrow):
     s.fill_rect(0, 0, W, H, UI_BG)
     draw_header(s, "SETTINGS", st)
     s.text_c(160, 203, "UP/DN: ROW    L/R: VALUE", UI_MUTED, UI_BG, 1)
-    for i in range(5):
+    for i in range(SETUP_ROWS):
         setup_row(s, i, values, i == selrow)
-    draw_footer(s, PAGE_SETUP, selrow == 5)
+    draw_footer(s, PAGE_SETUP, selrow == SETUP_ROWS)
 
 
 def page_about(s, uptime, st):
@@ -420,11 +424,11 @@ if __name__ == "__main__":
         hist.append(int(25 + (213.4 - 25) * (1 - math.exp(-3.1 * t))))
 
     s = Screen()
-    page_home(s, hist, 2134, 2000, 62, 35, 40, 25, 1, 0)
+    page_home(s, hist, 2134, 2000, 62, 35, 50, 25, 1, 3)
     write_png(os.path.join(out, "ui_home.png"), s)
 
     s = Screen()
-    page_setup(s, ["ON", "AUTO", "2.0", "0.05", "1.0"], 1, 2)
+    page_setup(s, ["ON", "AUTO", "MUTE", "2.0", "0.05", "1.0"], 1, 2)
     write_png(os.path.join(out, "ui_setup.png"), s)
 
     s = Screen()

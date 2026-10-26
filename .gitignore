@@ -17,6 +17,9 @@ build/
 *.launch
 *.bak
 
+# Graphify knowledge graph (regenerate with: graphify update .)
+graphify-out/
+
 # OS
 Thumbs.db
 .DS_Store

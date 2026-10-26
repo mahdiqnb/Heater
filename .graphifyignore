@@ -1,0 +1,5 @@
+# Graphify scope: the firmware itself, not the ST HAL vendor tree.
+# The HAL is ~3000 nodes of read-only code that buries the 30 symbols that
+# actually matter (control loop, dimmer, UI, drivers).
+Drivers/
+Debug/

@@ -58,7 +58,9 @@
 #define DIG_TH      6
 
 #define SETUP_TOP   32
-#define SETUP_RH    34
+#define SETUP_RH    27
+#define SETUP_RH_H  27
+#define SETUP_ROWS  6
 
 #define SPLASH_MS   2000UL
 #define SAMPLE_MS   500UL
@@ -77,6 +79,11 @@ static uint8_t  sel[PAGE_COUNT];
 static uint8_t  sel_dirty;
 static uint8_t  heater_on;
 static uint8_t  fan_auto;
+static uint8_t  fan2_mute;            /* box fan silenced by the user */
+static uint8_t  fan2_level;           /* requested box fan duty, 0..50  */
+
+static void apply_fan2(void);          /* programs the box fan from level + mute */
+static int16_t clamp16(int16_t v, int16_t lo, int16_t hi);
 static int16_t  sp10 = 2000;          /* setpoint in 0.1 degC */
 static int16_t  kp10 = 20, ki100 = 5, kd10 = 10;
 
@@ -320,11 +327,19 @@ static void home_meter(uint8_t idx, uint8_t pct, uint8_t selected) {
     static const uint16_t cols[4] = {UI_GREEN, UI_ORANGE, UI_BLUE, UI_BLUE};
     int16_t y = (int16_t)(145 + (int16_t)idx * 16);
     uint16_t bg = selected ? UI_SEL : UI_CARD;
+    /* the box fan row is also the mute indicator: a silenced fan must not be
+       mistaken for a fan that is simply set to 0 % */
+    uint8_t muted = (idx == 3) && fan2_mute;
     rrect(9, (int16_t)(y - 1), 158, 15, bg);
     txt(13, y, names[idx], selected ? UI_GOLD : UI_MUTED, bg, 1);
-    sprintf(buf, "%3d%%", pct);
-    txt_r(163, y, buf, selected ? UI_GOLD : UI_TEXT, bg, 1);
-    meter_bar(13, (int16_t)(y + 9), 150, 4, pct, cols[idx]);
+    if (muted) {
+        strcpy(buf, "MUTE");
+        txt_r(163, y, buf, UI_RED, bg, 1);
+    } else {
+        sprintf(buf, "%3d%%", pct);
+        txt_r(163, y, buf, selected ? UI_GOLD : UI_TEXT, bg, 1);
+    }
+    meter_bar(13, (int16_t)(y + 9), 150, 4, muted ? 0 : pct, cols[idx]);
 }
 
 static void draw_graph(void) {
@@ -392,26 +407,30 @@ static void draw_home_static(void) {
 }
 
 /* ============================================================== setup page */
-static const char *SET_LABEL[5] = {"HEATER", "FAN MODE", "KP", "KI", "KD"};
+static const char *SET_LABEL[SETUP_ROWS] = {
+    "HEATER", "FAN MODE", "BOX FAN", "KP", "KI", "KD"
+};
 
 static void setup_row(uint8_t i, uint8_t selected) {
     int16_t y = (int16_t)(SETUP_TOP + i * SETUP_RH);
     uint16_t bg = selected ? UI_SEL : UI_CARD;
-    panel(6, y, 310, 32, bg, selected ? UI_GOLD : UI_EDGE);
-    txt(16, (int16_t)(y + 5), SET_LABEL[i], selected ? UI_GOLD : UI_MUTED, bg, 1);
+    panel(6, y, 310, SETUP_RH_H, bg, selected ? UI_GOLD : UI_EDGE);
+    txt(16, (int16_t)(y + 4), SET_LABEL[i], selected ? UI_GOLD : UI_MUTED, bg, 1);
 
     switch (i) {
     case 0: strcpy(buf, heater_on ? "ON" : "OFF"); break;
     case 1: strcpy(buf, fan_auto ? "AUTO" : "MANUAL"); break;
-    case 2: sprintf(buf, "%d.%d", kp10 / 10, kp10 % 10); break;
-    case 3: sprintf(buf, "%d.%02d", ki100 / 100, ki100 % 100); break;
+    case 2: strcpy(buf, fan2_mute ? "MUTE" : "ON"); break;
+    case 3: sprintf(buf, "%d.%d", kp10 / 10, kp10 % 10); break;
+    case 4: sprintf(buf, "%d.%02d", ki100 / 100, ki100 % 100); break;
     default: sprintf(buf, "%d.%d", kd10 / 10, kd10 % 10); break;
     }
-    txt(16, (int16_t)(y + 15), buf, selected ? UI_GOLD : UI_TEXT, bg, 2);
+    txt(16, (int16_t)(y + 11), buf,
+        (i == 2 && fan2_mute) ? UI_RED : (selected ? UI_GOLD : UI_TEXT), bg, 2);
 
     if (selected) {
-        tri(282, (int16_t)(y + 11), 6, 10, UI_GOLD, -1);
-        tri(298, (int16_t)(y + 11), 6, 10, UI_GOLD, +1);
+        tri(282, (int16_t)(y + 8), 6, 10, UI_GOLD, -1);
+        tri(298, (int16_t)(y + 8), 6, 10, UI_GOLD, +1);
     }
 }
 
@@ -454,8 +473,8 @@ static void render_page(void) {
         break;
     case PAGE_SETUP:
         draw_setup_static();
-        for (uint8_t i = 0; i < 5; i++) setup_row(i, sel[PAGE_SETUP] == i);
-        draw_footer(sel[PAGE_SETUP] == 5);
+        for (uint8_t i = 0; i < SETUP_ROWS; i++) setup_row(i, sel[PAGE_SETUP] == i);
+        draw_footer(sel[PAGE_SETUP] == SETUP_ROWS);
         break;
     default:
         draw_about();
@@ -510,9 +529,12 @@ void UI_Init(void) {
     ki100 = cfg.ki_x100;
     kd10 = cfg.kd_x10;
 
+    fan2_mute = cfg.fan2_mute ? 1 : 0;
+    fan2_level = (uint8_t)clamp16(cfg.fan2_pct, 0, FAN_CH1_MAX_PCT);
+
     Dimmer_SetIron(cfg.iron_pct);
     Fan_SetSpeed(FAN_CH0, cfg.fan_pct);
-    Fan_SetSpeed(FAN_CH1, cfg.fan2_pct);
+    apply_fan2();
     Fan_SetAuto(fan_auto);
     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
     Control_SetEnabled(heater_on);
@@ -553,7 +575,8 @@ static void save_cfg(void) {
     cfg.setpoint_x10 = sp10;
     cfg.iron_pct = Dimmer_GetIron();
     cfg.fan_pct = Fan_GetSpeed(FAN_CH0);
-    cfg.fan2_pct = Fan_GetSpeed(FAN_CH1);
+    cfg.fan2_pct = fan2_level;
+    cfg.fan2_mute = fan2_mute;
     cfg.enabled = heater_on;
     cfg.fan_auto = fan_auto;
     cfg.kp_x10 = kp10;
@@ -574,6 +597,12 @@ static int16_t clamp16(int16_t v, int16_t lo, int16_t hi) {
     return v;
 }
 
+/* the box fan runs from the stored level, gated by the mute switch, so
+   unmuting always gives back the level the user asked for */
+static void apply_fan2(void) {
+    Fan_SetSpeed(FAN_CH1, fan2_mute ? 0 : fan2_level);
+}
+
 void UI_HandleKeys(void) {
     Keys_Update();
     uint8_t up = Key_Up_Pressed();
@@ -582,7 +611,8 @@ void UI_HandleKeys(void) {
     uint8_t rt = Key_Right_Pressed();
 
     if (up || dn || lf || rt) {
-        uint8_t n = (page == PAGE_HOME) ? 5 : (page == PAGE_SETUP) ? 6 : 1;
+        uint8_t n = (page == PAGE_HOME) ? 5
+                  : (page == PAGE_SETUP) ? (SETUP_ROWS + 1) : 1;
         uint8_t s = sel[page];
 
         if (up) { s = (s == 0) ? (uint8_t)(n - 1) : (uint8_t)(s - 1); sel_dirty = 1; }
@@ -607,13 +637,16 @@ void UI_HandleKeys(void) {
                 } else if (s == 3) {
                     /* the 12 V fan on XH501 is clamped by fan.c, keep the UI
                        inside the same window so the bar never lies */
-                    Fan_SetSpeed(FAN_CH1,
-                                 (uint8_t)clamp16((int16_t)((int16_t)Fan_GetSpeed(FAN_CH1) + dir * 5), 0, FAN_CH1_MAX_PCT));
+                    fan2_level = (uint8_t)clamp16((int16_t)((int16_t)fan2_level + dir * 5), 0, FAN_CH1_MAX_PCT);
+                    apply_fan2();
                     mark_dirty();
                 } else {
                     page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
                 }
             } else if (page == PAGE_SETUP) {
+                /* repainting one row instead of all six keeps the auto-repeat
+                   responsive: a full repaint over bit-banged SPI is slow */
+                uint8_t one_row = 1;
                 switch (s) {
                 case 0:
                     heater_on = heater_on ? 0 : 1;
@@ -629,26 +662,33 @@ void UI_HandleKeys(void) {
                     mark_dirty();
                     break;
                 case 2:
+                    /* the silent switch: left/right toggles the box fan */
+                    fan2_mute = fan2_mute ? 0 : 1;
+                    apply_fan2();
+                    mark_dirty();
+                    break;
+                case 3:
                     kp10 = clamp16((int16_t)(kp10 + dir), 0, 200);
                     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
                     mark_dirty();
                     break;
-                case 3:
+                case 4:
                     ki100 = clamp16((int16_t)(ki100 + dir), 0, 500);
                     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
                     mark_dirty();
                     break;
-                case 4:
+                case 5:
                     kd10 = clamp16((int16_t)(kd10 + dir), 0, 200);
                     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
                     mark_dirty();
                     break;
                 default:
                     page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
+                    one_row = 0;
                     break;
                 }
-                /* a value or a switch changed: repaint the rows */
-                sel_dirty = 1;
+                if (one_row) setup_row(s, 1);
+                else sel_dirty = 1;
             } else {
                 page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
                 sel_dirty = 1;
@@ -729,8 +769,8 @@ void UI_Update(float measured_c, uint8_t heater_pct, uint8_t iron_pct,
         }
     } else if (page == PAGE_SETUP) {
         if (sel_dirty) {
-            for (uint8_t i = 0; i < 5; i++) setup_row(i, sel[PAGE_SETUP] == i);
-            draw_footer(sel[PAGE_SETUP] == 5);
+            for (uint8_t i = 0; i < SETUP_ROWS; i++) setup_row(i, sel[PAGE_SETUP] == i);
+            draw_footer(sel[PAGE_SETUP] == SETUP_ROWS);
             sel_dirty = 0;
         }
     } else {
