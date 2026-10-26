@@ -106,9 +106,10 @@ void Control_Update(float measured_c, float setpoint_c, float ambient_c) {
     if (dt < 0.02f) dt = 0.02f;
     if (dt > 0.50f) dt = 0.50f;
 
-    /* absolute limit: never trust the setpoint while the sensor reads hot */
+    /* absolute limit: never trust the setpoint while the sensor reads hot.
+       The over-temperature latch itself lives in main.c, this is the last
+       line of defence inside the loop. */
     if (measured_c > ABS_MAX_C) {
-        fault = CTRL_FAULT_NONE; /* the overtemp logic in main owns this one */
         shut_down();
         prev_meas = measured_c;
         primed = 1;

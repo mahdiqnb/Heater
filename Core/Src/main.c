@@ -202,9 +202,9 @@ int main(void)
 
             if (Control_GetFault() != CTRL_FAULT_NONE) {
                 /* the loop detected that power does not produce heat: wrong or
-                   disconnected thermocouple. Stay off until the user re-arms. */
+                   disconnected thermocouple. The controller already holds the
+                   output at 0; the user re-arms by toggling HEATER off and on. */
                 overtemp = 2;
-                Control_SetEnabled(0);
             } else {
                 if (overtemp == 2) overtemp = 0;
                 /* The setpoint-relative limit only applies while the heater is
