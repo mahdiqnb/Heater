@@ -5,6 +5,11 @@
 /* half-period in 50us ticks: 50Hz -> 10ms = 200 ticks */
 #define HALF_PERIOD_TICKS 200
 
+/* If the mains signal disappears (blown fuse, lost zero-cross opto) the gate
+   driver must not be left high: when the power comes back the triac would be
+   on for the whole half period. 25 ms is two and a half mains periods. */
+#define ZC_TIMEOUT_TICKS 500UL
+
 static volatile uint32_t dim_tick = 0;
 static volatile uint8_t heater_pct = 0;
 static volatile uint8_t iron_pct = 0;
@@ -58,6 +63,13 @@ void Dimmer_ZeroCross(void) {
 
 void Dimmer_TickISR(void) {
     dim_tick++;
+
+    if ((dim_tick - last_zc_tick) > ZC_TIMEOUT_TICKS) {
+        HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
+        armed1 = 0;
+        armed2 = 0;
+    }
     /* zero-cross detection by sampling PC7 with debounce */
     uint8_t s = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_7) == GPIO_PIN_SET) ? 1 : 0;
     if (s != last_zc_state) {

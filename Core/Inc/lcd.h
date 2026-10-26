@@ -8,9 +8,13 @@
 #define LCD_H 240
 
 void LCD_Init(void);
+void LCD_SetWindow(int16_t x0, int16_t y0, int16_t x1, int16_t y1);
 void LCD_Fill(uint16_t color);
 void LCD_FillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
 void LCD_DrawPixel(int16_t x, int16_t y, uint16_t color);
+/* palette-indexed bitmap: w*h bytes, row major, indexed into pal[] */
+void LCD_DrawIndexed(int16_t x, int16_t y, int16_t w, int16_t h,
+                     const uint8_t *pix, const uint16_t *pal);
 void LCD_DrawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale);
 void LCD_DrawString(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg, uint8_t scale);
 int16_t LCD_StrWidth(const char *s, uint8_t scale);
