@@ -11,7 +11,14 @@
 #define SW4_PIN  GPIO_PIN_0
 #define SW4_PORT GPIOC
 
-#define DEBOUNCE_MS   10u
+#define DEBOUNCE_MS   30u
+
+/* A contact that bounces can look like release + press a few tens of ms later.
+ * A 30 ms debounce catches most of it, but one bounce is enough to move the
+ * menu two rows. No second press of the same key is therefore accepted within
+ * this window: a human cannot press the same key twice faster than that, and
+ * a bouncing contact cannot fake it. */
+#define MIN_PRESS_MS  150u
 
 /* Hold-to-repeat. A normal tap always gives exactly one step; if the key stays
  * down for REP_HOLD_MS it starts repeating, and the period shrinks from
@@ -59,15 +66,16 @@ static void service(key_t *k) {
     }
     if ((now - k->t_raw) >= DEBOUNCE_MS) {
         if (r && !k->deb) {                 /* new press */
-            k->edge = 1;
-            k->new_edge = 1;
-            /* A switch can drop its contact for a few ms and look like a new
-               press. Only a real release (> 250 ms) restarts the hold ramp,
-               otherwise the acceleration would restart over and over and the
-               value would crawl one step at a time. */
-            if (k->t_press == 0u || (uint32_t)(now - k->t_release) > 250u)
+            /* Debounce the *presses*, not only the level: a single bouncy
+               contact can produce a second "new press" a few samples later.
+               Anything closer than MIN_PRESS_MS to the previous accepted
+               press is treated as the same physical press. */
+            if (k->t_press == 0u || (uint32_t)(now - k->t_press) >= MIN_PRESS_MS) {
+                k->edge = 1;
+                k->new_edge = 1;
                 k->t_press = now;
-            k->t_rep = now + REP_HOLD_MS;
+                k->t_rep = now + REP_HOLD_MS;
+            }
         } else if (!r && k->deb) {          /* released */
             k->t_rep = 0;
             k->t_release = now;

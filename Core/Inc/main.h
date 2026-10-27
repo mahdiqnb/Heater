@@ -73,12 +73,17 @@ void Error_Handler(void);
 #define RESET_GPIO_Port GPIOA
 #define D_C_Pin GPIO_PIN_5
 #define D_C_GPIO_Port GPIOA
-#define ERR_LED_Pin GPIO_PIN_12
-#define ERR_LED_GPIO_Port GPIOB
+/* LED map straight from the schematic (sheet "MCU"):
+ *   PB12 = Ch2 LED   (iron / channel 2)
+ *   PB13 = Ch1 LED   (heater / channel 1)
+ *   PB14 = ERR LED
+ * All three are active-LOW (pin HIGH = LED off). */
+#define CH2_LED_Pin GPIO_PIN_12
+#define CH2_LED_GPIO_Port GPIOB
 #define CH1_LED_Pin GPIO_PIN_13
 #define CH1_LED_GPIO_Port GPIOB
-#define CH2_LED_Pin GPIO_PIN_14
-#define CH2_LED_GPIO_Port GPIOB
+#define ERR_LED_Pin GPIO_PIN_14
+#define ERR_LED_GPIO_Port GPIOB
 #define CH1_Pin GPIO_PIN_15
 #define CH1_GPIO_Port GPIOB
 #define CH2_Pin GPIO_PIN_6

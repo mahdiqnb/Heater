@@ -105,6 +105,7 @@ static uint8_t  keys_busy;            /* a value key is being held */
 
 /* what is already on the glass */
 static uint8_t  last_page = 0xFF;
+static uint8_t  last_sel_setup = 0xFF;  /* SETUP row currently drawn selected */
 static uint8_t  last_status = 0xFF;
 static int16_t  last_t10 = -1;
 static int16_t  last_sp10 = -1;
@@ -503,6 +504,7 @@ static void render_page(void) {
 
 static void sync_cache(void) {
     last_page = page;
+    last_sel_setup = sel[PAGE_SETUP];
     last_status = cur_status;
     last_t10 = v_t10;
     last_sp10 = sp10;
@@ -824,8 +826,12 @@ void UI_Update(float measured_c, uint8_t heater_pct, uint8_t iron_pct,
     v_fan2 = fan2_pct;
     v_t10 = (int16_t)(measured_c * 10.0f + 0.5f);
     if (v_t10 < 0) v_t10 = 0;
+    /* In manual mode the element is driven even when the HEATER switch is
+       off (the user asked for a fixed duty directly), so the header must say
+       RUN instead of STOP. */
     cur_status = (fault == 2) ? 4 : (fault == 1) ? 2
-               : (!heater_on ? 0 : (sp10 == 0 ? 3 : 1));
+               : (heater_manual ? 1
+               : (!heater_on ? 0 : (sp10 == 0 ? 3 : 1)));
     /* a channel is asking for power but no mains edge arrives: the triacs can
        never be fired, so show it instead of silently doing nothing */
     if ((v_heat > 0 || v_iron > 0) && !Dimmer_ZcOk()) cur_status = 5;
@@ -888,8 +894,29 @@ void UI_Update(float measured_c, uint8_t heater_pct, uint8_t iron_pct,
         }
     } else if (page == PAGE_SETUP) {
         if (sel_dirty) {
-            for (uint8_t i = 0; i < SETUP_ROWS; i++) setup_row(i, sel[PAGE_SETUP] == i);
-            draw_footer(sel[PAGE_SETUP] == SETUP_ROWS);
+            uint8_t cur = sel[PAGE_SETUP];
+            uint8_t prev = last_sel_setup;
+
+            if (prev > SETUP_ROWS) {
+                /* no valid cached row (first paint): redraw everything */
+                for (uint8_t i = 0; i < SETUP_ROWS; i++)
+                    setup_row(i, cur == i);
+                draw_footer(cur == SETUP_ROWS);
+            } else {
+                /* Only the two rows whose "selected" look changed need a
+                 * repaint. A full seven-row repaint over the bit-banged SPI
+                 * stalls the main loop for hundreds of milliseconds, which is
+                 * what made the cursor feel like it jumped two rows: the
+                 * second press arrived while the first repaint was still
+                 * running. */
+                if (prev < SETUP_ROWS && prev != cur)
+                    setup_row(prev, 0);
+                if (cur < SETUP_ROWS)
+                    setup_row(cur, 1);
+                if ((prev == SETUP_ROWS) != (cur == SETUP_ROWS))
+                    draw_footer(cur == SETUP_ROWS);
+            }
+            last_sel_setup = cur;
             sel_dirty = 0;
         }
     } else {

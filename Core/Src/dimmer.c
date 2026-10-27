@@ -2,19 +2,34 @@
 #include "main.h"
 #include "stm32g0xx_hal.h"
 
-/* half-period in 50us ticks: 50Hz -> 10ms = 200 ticks.
- * The H11AA1 opto fires on RISING edge only (Falling callback is empty).
- * One zero-cross event arrives every 10ms = 200 ticks. */
-#define HALF_PERIOD_TICKS     200
+/* ============================================================== timing ====
+ * TIM3 ticks every 50 us. At 50 Hz one half-cycle is 10 ms = 200 ticks.
+ *
+ * The firing schedule is NOT rebuilt from every zero-cross edge. It runs on
+ * its own half-cycle grid driven by TIM3, and a zero-cross only re-locks that
+ * grid. That matters on this board: the H11AA1 sits on the same mains as two
+ * triacs, and the burst when either triac fires can add an edge to PC7. With
+ * the old code every such edge cancelled the pending gate pulse of the other
+ * channel, so raising the iron duty switched the heater off. Now a bogus edge
+ * can at worst shift one half-cycle by a few hundred microseconds; it can no
+ * longer stop a channel from firing.
+ */
+#define HALF_PERIOD_TICKS     200UL
 
-/* Minimum valid interval between two zero-cross events: 8ms = 160 ticks.
- * Anything closer is a spurious bounce/noise edge and is rejected. */
-#define ZC_MIN_INTERVAL_TICKS 160UL
+/* How far from the expected crossing a real zero-cross may arrive.
+ * The H11AA1 output goes HIGH a little before the true zero (the mains has to
+ * fall below the opto LED threshold), and the TIM3 grid is accurate to a
+ * tick, so 8 ticks = 400 us is plenty. An edge outside this window is the
+ * burst made when a triac fires: re-locking to it would shift every following
+ * half-cycle by the firing delay, so it is ignored and the free-running grid
+ * carries on. The window is wide enough for a 50 Hz +-5 % mains. */
+#define ZC_WINDOW_TICKS       8UL
 
-/* Safety: if no ZC for 25ms force gates off (2.5 mains periods). */
+/* No zero-cross for 25 ms (2.5 mains periods) -> the mains is gone. Without a
+ * phase reference a phase-angle dimmer must not fire at all. */
 #define ZC_TIMEOUT_TICKS      500UL
 
-/* ZC considered lost after 100ms of silence (generous window for slow LCD). */
+/* No zero-cross for 100 ms -> tell the UI ("NO AC"). */
 #define ZC_LOST_TICKS         2000UL
 
 /* CH1 (heater) full-on threshold.
@@ -26,34 +41,42 @@
  * the next half-cycle, giving true full conduction. */
 #define HEATER_FULLON_PCT     80u
 
+/* CH2 (iron) full-on threshold.
+ * Same logic as heater, but iron works fine up to 94%, so threshold is 95. */
+#define IRON_FULLON_PCT       95u
+
 /* Gate pulse width for phase-control range (0 .. HEATER_FULLON_PCT-1).
- * MOC3021 needs ≥10 µs; 3 ticks = 150 µs is reliable and short enough not
+ * MOC3021 needs >=10 us; 3 ticks = 150 us is reliable and short enough not
  * to overlap the next ZC event. */
 #define GATE_PULSE_TICKS      3u
 
 /* ----------------------------------------------------------------- state -- */
-static volatile uint32_t dim_tick    = 0;
-static volatile uint8_t  heater_pct  = 0;
-static volatile uint8_t  iron_pct    = 0;
+static volatile uint32_t dim_tick     = 0;  /* free running 50 us counter     */
+static volatile uint32_t half_start   = 0;  /* tick of the current half-cycle */
+static volatile uint32_t last_zc_tick = 0;  /* last accepted zero-cross       */
+static volatile uint8_t  synced       = 0;  /* 1 = mains phase is known       */
 
-static volatile uint32_t fire1       = 0, fire2    = 0;
-static volatile uint8_t  armed1      = 0, armed2   = 0;
-static volatile uint32_t gate1_off   = 0, gate2_off = 0;
-static volatile uint32_t last_zc_tick = 0;
+static volatile uint8_t  heater_pct   = 0;
+static volatile uint8_t  iron_pct     = 0;
 
-/* 1 while CH1 gate is held HIGH in full-on mode */
-static volatile uint8_t  ch1_fullon  = 0;
+static volatile uint32_t fire1        = 0, fire2    = 0;
+static volatile uint8_t  armed1       = 0, armed2   = 0;
+static volatile uint32_t gate1_off    = 0, gate2_off = 0;
+
+/* 1 while CH1/CH2 gates are held HIGH in full-on mode */
+static volatile uint8_t  ch1_fullon   = 0;
+static volatile uint8_t  ch2_fullon   = 0;
 
 /* --------------------------------------------------------- RMS delay table -
- * Maps 0..100 % request to firing-angle delay in 50 µs ticks.
+ * Maps 0..100 % request to firing-angle delay in 50 us ticks.
  * Inverse of the phase-control RMS equation:
- *   (Vout/Vin)^2 = (π - α + sin(2α)/2) / π
+ *   (Vout/Vin)^2 = (pi - a + sin(2a)/2) / pi
  *
- *   0 %  → 200 ticks  (full half-period, no conduction → 0 V)
- *   5 %  → 185 ticks  (~9.25 ms delay  → ~11 V RMS)
- *  50 %  → 126 ticks  (~6.3 ms delay   → ~110 V RMS)
- *  79 %  →  47 ticks  (last phase-ctrl entry before full-on)
- * ≥80 %  → full-on (gate held HIGH, see HEATER_FULLON_PCT)
+ *   0 %  -> 200 ticks  (full half-period, no conduction -> 0 V)
+ *   5 %  -> 185 ticks  (~9.25 ms delay  -> ~11 V RMS)
+ *  50 %  -> 126 ticks  (~6.3 ms delay   -> ~110 V RMS)
+ *  79 %  ->  47 ticks  (last phase-ctrl entry before full-on)
+ * >=80 %  -> full-on (gate held HIGH, see HEATER_FULLON_PCT)
  */
 static const uint8_t rms_delay_ticks[101] = {
     200, 195, 192, 190, 187, 185, 184, 182, 180, 178,
@@ -75,23 +98,73 @@ static uint32_t RmsDelayTicks(uint8_t percent) {
     return (uint32_t)rms_delay_ticks[percent];
 }
 
+/* --------------------------------------------------------- half scheduling -
+ * Arm both channels for the half-cycle that starts at dim_tick.
+ * Called from the timer ISR and from the zero-cross ISR, which share one
+ * NVIC priority, so the two can never nest. */
+static void schedule_half(void) {
+    /* ---- CH2 (iron) ---- */
+    if (ch2_fullon) {
+        HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
+        armed2    = 0;
+        gate2_off = 0;
+        if (iron_pct) {
+            uint32_t delay = RmsDelayTicks(iron_pct);
+            if (delay == 0) {
+                HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_SET);
+                gate2_off = dim_tick + GATE_PULSE_TICKS;
+            } else {
+                fire2  = dim_tick + delay;
+                armed2 = 1;
+            }
+        }
+    }
+
+    /* ---- CH1 (heater) ---- */
+    if (ch1_fullon) {
+        HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
+        armed1    = 0;
+        gate1_off = 0;
+        if (heater_pct) {
+            uint32_t delay = RmsDelayTicks(heater_pct);
+            if (delay == 0) {
+                HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
+                gate1_off = dim_tick + GATE_PULSE_TICKS;
+            } else {
+                fire1  = dim_tick + delay;
+                armed1 = 1;
+            }
+        }
+    }
+}
+
 /* ================================================================== API === */
 
 void Dimmer_Init(void) {
     HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
-    dim_tick    = 0;
+    dim_tick     = 0;
+    half_start   = 0;
     last_zc_tick = 0;
-    heater_pct  = 0;
-    iron_pct    = 0;
+    synced       = 0;
+    heater_pct   = 0;
+    iron_pct     = 0;
     fire1 = fire2 = 0;
     armed1 = armed2 = 0;
     gate1_off = gate2_off = 0;
-    ch1_fullon  = 0;
+    ch1_fullon = 0;
+    ch2_fullon = 0;
 }
 
 void Dimmer_SetHeater(uint8_t percent) {
     if (percent > 100) percent = 100;
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     heater_pct = percent;
 
     /* Enter or leave full-on mode immediately so the gate state is correct
@@ -99,23 +172,36 @@ void Dimmer_SetHeater(uint8_t percent) {
     if (percent >= HEATER_FULLON_PCT) {
         if (!ch1_fullon) {
             ch1_fullon = 1;
-            /* Cancel any pending phase-control pulse and hold gate HIGH. */
             armed1    = 0;
             gate1_off = 0;
             HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
         }
-    } else {
-        if (ch1_fullon) {
-            ch1_fullon = 0;
-            /* Gate will be handled by the next ZeroCross event. */
-            HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
-        }
+    } else if (ch1_fullon) {
+        ch1_fullon = 0;
+        HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
     }
+    __set_PRIMASK(primask);
 }
 
 void Dimmer_SetIron(uint8_t percent) {
     if (percent > 100) percent = 100;
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     iron_pct = percent;
+
+    if (percent >= IRON_FULLON_PCT) {
+        if (!ch2_fullon) {
+            ch2_fullon = 1;
+            armed2    = 0;
+            gate2_off = 0;
+            HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_SET);
+        }
+    } else if (ch2_fullon) {
+        ch2_fullon = 0;
+        HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
+    }
+    __set_PRIMASK(primask);
 }
 
 uint8_t Dimmer_GetHeater(void) { return heater_pct; }
@@ -130,19 +216,33 @@ uint8_t Dimmer_ZcOk(void) {
 void Dimmer_TickISR(void) {
     dim_tick++;
 
-    /* Safety: no ZC for 25 ms → force gates off (except full-on CH1). */
-    if ((dim_tick - last_zc_tick) > ZC_TIMEOUT_TICKS) {
+    /* No mains reference: nothing may fire (full-on needs no phase, though). */
+    if (!synced || (dim_tick - last_zc_tick) > ZC_TIMEOUT_TICKS) {
+        synced = 0;
         if (!ch1_fullon) {
             HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
             armed1    = 0;
             gate1_off = 0;
         }
-        HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
-        armed2    = 0;
-        gate2_off = 0;
+        if (!ch2_fullon) {
+            HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
+            armed2    = 0;
+            gate2_off = 0;
+        }
+        return;
     }
 
-    /* CH1 full-on: nothing to do — gate is already HIGH and stays there. */
+    /* Free-running half-cycle grid. A zero-cross re-locks it; if an edge is
+     * missed the schedule simply continues from here. */
+    if ((dim_tick - half_start) >= HALF_PERIOD_TICKS) {
+        half_start += HALF_PERIOD_TICKS;
+        /* If the ISR was held off for more than a whole half-cycle (a Flash
+         * write, for instance), resynchronise instead of calling
+         * schedule_half() several ticks in a row and firing repeatedly. */
+        if ((dim_tick - half_start) >= HALF_PERIOD_TICKS)
+            half_start = dim_tick;
+        schedule_half();
+    }
 
     /* CH1 phase-control: fire when delay expires */
     if (armed1 && dim_tick >= fire1) {
@@ -162,58 +262,37 @@ void Dimmer_TickISR(void) {
         HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
         gate1_off = 0;
     }
-    if (gate2_off != 0 && dim_tick >= gate2_off) {
+    if (!ch2_fullon && gate2_off != 0 && dim_tick >= gate2_off) {
         HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
         gate2_off = 0;
     }
 }
 
 void Dimmer_ZeroCross(void) {
-    /* Reject spurious edge closer than 8 ms to the previous one. */
-    if ((dim_tick - last_zc_tick) < ZC_MIN_INTERVAL_TICKS) return;
+    uint32_t now = dim_tick;
 
-    /* ---- CH2 (iron): always phase-control ---- */
-    HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
-    armed2    = 0;
-    gate2_off = 0;
-
-    if (iron_pct == 0) {
-        /* nothing to arm */
-    } else {
-        uint32_t delay = RmsDelayTicks(iron_pct);
-        if (delay == 0) {
-            HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_SET);
-            gate2_off = dim_tick + GATE_PULSE_TICKS;
-        } else {
-            fire2  = dim_tick + delay;
-            armed2 = 1;
-        }
+    if (!synced) {
+        /* first edge after power-up or after a mains dropout: lock on */
+        synced       = 1;
+        last_zc_tick = now;
+        half_start   = now;
+        schedule_half();
+        return;
     }
 
-    /* ---- CH1 (heater) ---- */
-    if (ch1_fullon) {
-        /* Full-on mode: gate was already HIGH; it was momentarily reset by
-         * the MOC3021 TRIAC-off at ZC, so drive it HIGH again immediately. */
-        HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
-    } else {
-        /* Phase-control mode */
-        HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
-        armed1    = 0;
-        gate1_off = 0;
+    /* The grid free-runs at exactly one half-period, so the next real crossing
+     * is expected HALF_PERIOD_TICKS after half_start. Accept an edge only in a
+     * small window around that point (just before it, or just after the tick
+     * ISR has already advanced the grid). Anything in the middle of the
+     * half-cycle is the burst from a triac firing and must not re-lock the
+     * phase, otherwise a low dimmer duty would pull every following
+     * half-cycle early. */
+    uint32_t since_half = now - half_start;
+    if (since_half > ZC_WINDOW_TICKS &&
+        since_half < (HALF_PERIOD_TICKS - ZC_WINDOW_TICKS))
+        return;
 
-        if (heater_pct == 0) {
-            /* nothing to arm */
-        } else {
-            uint32_t delay = RmsDelayTicks(heater_pct);
-            if (delay == 0) {
-                HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
-                gate1_off = dim_tick + GATE_PULSE_TICKS;
-            } else {
-                fire1  = dim_tick + delay;
-                armed1 = 1;
-            }
-        }
-    }
-
-    last_zc_tick = dim_tick;
+    last_zc_tick = now;
+    half_start   = now;
+    schedule_half();
 }

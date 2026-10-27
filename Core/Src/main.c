@@ -49,7 +49,8 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim17;
 
 /* USER CODE BEGIN PV */
-static uint8_t overtemp = 0;
+static uint8_t overtemp = 0;      /* 0 = ok, 1 = over temperature, 2 = sensor */
+static uint8_t overtemp_cnt = 0;  /* consecutive 100 ms cycles above the limit */
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim15;
 bool ZERO = false;
@@ -70,9 +71,11 @@ bool ZERO = false;
  */
 volatile uint16_t dbg_adc_raw  = 0;   /* latest single raw ADC count  0..4095 */
 volatile uint16_t dbg_adc_filt = 0;   /* 16-sample moving average              */
-volatile uint16_t dbg_adc_mv   = 0;   /* millivolts at PA0             0..3300  */
+volatile uint16_t dbg_adc_mv    = 0;   /* millivolts at PA0             0..3300  */
 volatile int32_t  dbg_tc_emf_uv = 0;  /* thermocouple EMF in µV (incl. CJ)    */
-volatile int16_t  dbg_hot_c    = 0;   /* temperature × 10, e.g. 1234 = 123.4C *//* USER CODE END PV */
+volatile int16_t  dbg_hot_c     = 0;  /* temperature × 10, instantaneous      */
+volatile int16_t  dbg_hot_avg   = 0;  /* temperature × 10, 8-sample moving avg */
+/* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -221,19 +224,22 @@ int main(void) {
 	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 	if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
 		Error_Handler();
-	HAL_NVIC_SetPriority(TIM3_IRQn, 1, 0);
+	/* TIM3 (50 us tick) and the zero-cross EXTI both call schedule_half().
+	   With the tick at a lower priority the edge ISR could preempt it in the
+	   middle of the half-cycle setup and arm the same channel twice. Equal
+	   priorities on Cortex-M0+ mean they can never nest, which is exactly
+	   what the shared state needs. */
+	HAL_NVIC_SetPriority(TIM3_IRQn, 0, 0);
 	HAL_NVIC_EnableIRQ(TIM3_IRQn);
-	/* the zero-cross edge outranks the tick: it must never be delayed */
 	HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
 	HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+
+	/* Dimmer state must be ready BEFORE the timer can call the ISR: both the
+	   tick and the zero-cross callback dereference it. Starting the timer
+	   first left the first few milliseconds running on reset values. */
+	Dimmer_Init();
 	if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK)
 		Error_Handler();
-
-	/* Dimmer must be initialised BEFORE the timer starts firing. The TickISR
-	   and ZeroCross callbacks reference dimmer state variables; calling
-	   Dimmer_Init() after Start_IT leaves those running on uninitialised
-	   values for the first few milliseconds. */
-	Dimmer_Init();
 
 	/* The display comes up first so any later failure is visible on screen. */
 	Keys_Init();
@@ -317,6 +323,18 @@ int main(void) {
 
 				/* temperature from the same path used for control */
 				dbg_hot_c = (int16_t)(hot * 10.0f + 0.5f);
+
+				/* 8-sample moving average of temperature (smoothed display) */
+				{
+					static int32_t tacc = 0;
+					static int16_t tbuf[8] = {0};
+					static uint8_t tidx = 0;
+					tacc -= tbuf[tidx];
+					tbuf[tidx] = dbg_hot_c;
+					tacc += dbg_hot_c;
+					tidx = (tidx + 1) & 0x07u;
+					dbg_hot_avg = (int16_t)(tacc / 8);
+				}
 			}
 
 			float sp = UI_GetSetpoint();
@@ -326,44 +344,77 @@ int main(void) {
 				 disconnected thermocouple. The controller already holds the
 				 output at 0; the user re-arms by toggling HEATER off and on. */
 				overtemp = 2;
+				overtemp_cnt = 0;
 			} else {
 				if (overtemp == 2)
 					overtemp = 0;
 				/* The setpoint-relative limit only applies while the heater is
 				 armed: with setpoint 0 a warm (>40C) residual temperature must
-				 not raise ERR. The absolute 520C limit always applies. */
+				 not raise ERR. The absolute 520C limit always applies.
+				 *
+				 * A single 100 ms sample can still jump on a mains burst even
+				 * after the filtering in temp.c, and tripping on one sample
+				 * turns a transient into a visible fault. Three consecutive
+				 * cycles above the limit are required; a real over-temperature
+				 * still stops the element within 300 ms. */
 				if ((Control_GetEnabled() && sp > 0.0f && hot > sp + 40.0f)
 						|| hot > 520.0f) {
-					overtemp = 1;
-					Control_SetEnabled(0);
-				} else if (overtemp == 1 && hot < sp + 20.0f) {
-					overtemp = 0;
-					/* restore the user's own choice instead of always re-arming */
-					Control_SetEnabled(UI_GetEnabled());
+					if (overtemp_cnt < 3)
+						overtemp_cnt++;
+					if (overtemp_cnt >= 3) {
+						overtemp = 1;
+						Control_SetEnabled(0);
+					}
+				} else {
+					overtemp_cnt = 0;
+					if (overtemp == 1 && hot < sp + 20.0f) {
+						overtemp = 0;
+						/* restore the user's own choice instead of always
+						 * re-arming, but only if not in manual mode (manual
+						 * bypasses the PID) */
+						if (!UI_GetHeaterManual())
+							Control_SetEnabled(UI_GetEnabled());
+					}
 				}
 			}
 
-			Control_Update(hot, sp, amb);
-			/* in AUTO the heater fan follows the heater, in MANUAL it keeps the
-			 user value; the aux fan is always manual */
-			Fan_Update(Control_GetHeaterPercent() > 0);
-
-			/* If the user switched heater to manual % on the SETTINGS page,
-			 bypass the PID and drive the dimmer directly. */
-			if (UI_GetHeaterManual()) {
-				Dimmer_SetHeater(UI_GetHeaterManualPct());
-			}
+			/* In manual mode the PID is bypassed completely. Running it would
+			   only call Dimmer_SetHeater(0) every tick and fight the manual
+			   value written below. */
+			if (!UI_GetHeaterManual())
+				Control_Update(hot, sp, amb);
 		}
 
-		uint8_t heater_pct = Control_GetHeaterPercent();
+		/* --- effective CH1 duty: one source of truth -----------------------
+		 * Manual override wins over the PID, an over-temperature or sensor
+		 * fault wins over both. Writing this every pass (not only on the
+		 * 100 ms control tick) is what keeps the dimmer, the LCD and the LED
+		 * in agreement. Before, the UI and the LED showed the PID output
+		 * while the dimmer was driven by the manual value, so a manual
+		 * percentage looked as if it did nothing. */
+		uint8_t heater_pct;
+		if (overtemp) {
+			heater_pct = 0;
+		} else if (UI_GetHeaterManual()) {
+			heater_pct = UI_GetHeaterManualPct();
+		} else {
+			heater_pct = Control_GetHeaterPercent();
+		}
+		Dimmer_SetHeater(heater_pct);
+
+		/* In AUTO the heater fan follows the heater (manual included, so a
+		   manual duty cannot cook the element with no airflow); the aux fan
+		   is always manual. */
+		Fan_Update(heater_pct > 0);
+
 		uint8_t iron_pct = Dimmer_GetIron();
 		uint8_t fan_pct = Fan_GetSpeed(FAN_CH0);
 		uint8_t fan2_pct = Fan_GetSpeed(FAN_CH1);
 
 		/* LEDs (active-low: pin LOW = LED on)
-		 * ERR_LED  = PB12: روشن وقتی overtemp یا fault
-		 * CH1_LED  = PB13: روشن وقتی heater فعاله
-		 * CH2_LED  = PB14: روشن وقتی iron فعاله */
+		 * ERR_LED  = PB14: on while overtemp or fault
+		 * CH1_LED  = PB13: on while the heater is driven
+		 * CH2_LED  = PB12: on while the iron is driven */
 		HAL_GPIO_WritePin(ERR_LED_GPIO_Port, ERR_LED_Pin,
 				overtemp ? GPIO_PIN_RESET : GPIO_PIN_SET);
 		HAL_GPIO_WritePin(CH1_LED_GPIO_Port, CH1_LED_Pin,
@@ -780,9 +831,10 @@ static void MX_GPIO_Init(void) {
 	/*Configure GPIO pin Output Level */
 	HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
 
-	/*Configure GPIO pin Output Level */
+	/* All three LEDs are active-LOW: drive the pins HIGH at boot so the
+	   board does not flash every LED while the UI is still starting. */
 	HAL_GPIO_WritePin(GPIOB, ERR_LED_Pin | CH1_LED_Pin | CH2_LED_Pin,
-			GPIO_PIN_RESET);
+			GPIO_PIN_SET);
 
 	/*Configure GPIO pins : PC0 SW3_Pin SW2_Pin SW1_Pin */
 	GPIO_InitStruct.Pin = GPIO_PIN_0 | SW3_Pin | SW2_Pin | SW1_Pin;
@@ -811,13 +863,23 @@ static void MX_GPIO_Init(void) {
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(CH1_GPIO_Port, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : CH2_Pin (triac gate, plain output) */
+	/*Configure GPIO pin : CH2_Pin (triac gate, plain output)
+	 * The Pin field must be rewritten: the previous call left CH1_Pin in it,
+	 * so CH2 (PC6) was never configured as an output and the iron gate stayed
+	 * in its reset state. */
+	GPIO_InitStruct.Pin = CH2_Pin;
 	HAL_GPIO_Init(CH2_GPIO_Port, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : ZERO_CROSS_Pin */
+	/*Configure GPIO pin : ZERO_CROSS_Pin
+	 * Rising edge only: the H11AA1 output is HIGH around the zero crossing
+	 * (collector pulled up, phototransistor conducting near 0 V), so its
+	 * rising edge is the true zero point. Using both edges called the dimmer
+	 * twice per half-cycle and halved the effective period.
+	 * The board already has an external 10 k pull-up on the collector, so the
+	 * internal one is redundant and is left off. */
 	GPIO_InitStruct.Pin = ZERO_CROSS_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	HAL_GPIO_Init(ZERO_CROSS_GPIO_Port, &GPIO_InitStruct);
 
 	/* EXTI interrupt init*/

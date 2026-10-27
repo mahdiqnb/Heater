@@ -21,9 +21,20 @@
 #define ADC_VREF  3.3f
 #define ADC_FULL  4095.0f
 
-/* eight conversions per reading; the extremes are thrown away, so one noisy
-   sample (the triac is switching 24V next door) cannot move the result */
-#define TC_OS     8
+/* One mains cycle at 50 Hz is 20 ms. The triacs switch 24 V next to the
+   thermocouple cable, so a conversion taken at one firing phase sees a
+   different amount of coupling than one taken at another phase. Sampling at
+   ~1 ms intervals across a whole cycle visits every phase, so the average is
+   the same in every reading instead of drifting with the dimmer duty -- that
+   drift is what made the heater and the iron appear to interact.
+
+   The ~19 ms this blocks happens inside the 100 ms control tick, so the loop
+   period stays at ~100 ms and the key scan at the top of the loop is not
+   affected. */
+#define TC_OS        20
+#define TC_SAMPLE_MS 1
+
+/* the extremes are thrown away, so one noisy sample cannot move the result */
 
 /* EMF of the cold junction, type K, in mV: quadratic fit of the 0..80 C part
    (0.798 mV @20C, 1.611 @40C, 2.436 @60C) */
@@ -82,11 +93,13 @@ uint8_t Temp_ReadAmbient(float *amb) {
     return 0;
 }
 
-/* trimmed mean of TC_OS conversions */
+/* trimmed mean of TC_OS conversions spread over one mains cycle */
 static uint16_t tc_average(void) {
     uint16_t lo = 0xFFFF, hi = 0;
     uint32_t sum = 0;
     for (uint8_t i = 0; i < TC_OS; i++) {
+        if (i)
+            HAL_Delay(TC_SAMPLE_MS);
         uint16_t v = Temp_ReadADC();
         if (v < lo) lo = v;
         if (v > hi) hi = v;
@@ -112,16 +125,20 @@ static float k_inverse(float mv) {
 }
 
 /* A single conversion must not be allowed to jump the display. One count is
-   about 5.3 uV at the input, i.e. roughly 0.14 C, so 60 counts is a step no
-   real thermocouple makes in one 100 ms cycle. */
-#define TC_SPIKE_COUNTS 60
+   about 5.3 uV at the input, i.e. roughly 0.14 C, so 200 counts (~28 C) is
+   a step no real thermocouple makes in one 100 ms cycle due to conduction.
+   Raised from the original 60 so fast-heating elements are not artificially
+   slowed down. Real mains-burst spikes are still caught by tc_deglitch(). */
+#define TC_SPIKE_COUNTS 200
 
-/* ...and no element on this heater moves faster than this either (per 100 ms
-   control cycle, i.e. 100 C/s). Instead of freezing the reading -- which
-   would leave the PID running on a stale value -- the output is slew limited,
-   so a burst is cut down to a small visible step and a real change catches up
-   within a few cycles. */
-#define TC_MAX_STEP_C   10.0f
+/* Maximum temperature change the output is allowed to follow per 100 ms
+   control cycle. The element can heat at >30 C/s when at full power, so
+   50 C/cycle (= 500 C/s) is high enough to track real heating while still
+   rejecting single-cycle glitches from a loose thermocouple screw.
+   The original 10 C/cycle (100 C/s) was too conservative: it caused the
+   displayed temperature to lag ~10 s behind reality at full power, making
+   the PID overshoot badly because it thought the element was still cold. */
+#define TC_MAX_STEP_C   50.0f
 
 static uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
     uint16_t t;
