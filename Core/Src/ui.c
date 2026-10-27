@@ -58,9 +58,9 @@
 #define DIG_TH      6
 
 #define SETUP_TOP   32
-#define SETUP_RH    27
-#define SETUP_RH_H  27
-#define SETUP_ROWS  6
+#define SETUP_RH    25   /* 7 rows * 25px = 175px; fits before footer at y=212 */
+#define SETUP_RH_H  24
+#define SETUP_ROWS  7    /* HEATER, FAN MODE, BOX FAN, KP, KI, KD, HEATER % */
 
 #define SPLASH_MS   2000UL
 #define SAMPLE_MS   500UL
@@ -81,6 +81,8 @@ static uint8_t  heater_on;
 static uint8_t  fan_auto;
 static uint8_t  fan2_mute;            /* box fan silenced by the user */
 static uint8_t  fan2_level;           /* requested box fan duty, 0..50  */
+static uint8_t  heater_manual;        /* 0=PID auto, 1=manual % override */
+static uint8_t  heater_manual_pct;    /* 0..100, only used when heater_manual=1 */
 
 static void apply_fan2(void);          /* programs the box fan from level + mute */
 static int16_t clamp16(int16_t v, int16_t lo, int16_t hi);
@@ -98,6 +100,8 @@ static int16_t  hist[PLOT_W];
 static uint8_t  hist_n;
 static uint32_t last_sample;
 static uint8_t  graph_dirty;
+static uint32_t last_graph_ms;        /* throttles the trend redraw */
+static uint8_t  keys_busy;            /* a value key is being held */
 
 /* what is already on the glass */
 static uint8_t  last_page = 0xFF;
@@ -119,6 +123,10 @@ static void hline(int16_t x, int16_t y, int16_t w, uint16_t c) {
 
 static void line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t c) {
     int16_t dx = (x1 > x0) ? (int16_t)(x1 - x0) : (int16_t)(x0 - x1);
+    /* dy must be negative here: that is what makes the two error tests of the
+       Bresenham loop converge. With a positive dy the loop never advances y
+       and spins forever -- which is exactly what the status icon did, freezing
+       the UI on the first frame. */
     int16_t dy = (y1 > y0) ? (int16_t)(y0 - y1) : (int16_t)(y1 - y0);
     int16_t sx = (x0 < x1) ? 1 : -1;
     int16_t sy = (y0 < y1) ? 1 : -1;
@@ -257,9 +265,11 @@ static void trace(int16_t x, int16_t y, int16_t len, int8_t dir, uint16_t c) {
 
 /* =============================================================== chrome */
 static void draw_status(uint8_t st) {
-    static const char *lbl[5] = {"STOP", "RUN ", "OVER", "IDLE", "NO HEAT"};
-    if (st > 4) st = 0;
-    uint16_t col = (st == 2 || st == 4) ? UI_RED : (st == 1) ? UI_GREEN : (st == 3) ? UI_GOLD_D : UI_MUTED;
+    static const char *lbl[6] = {"STOP", "RUN ", "OVER", "IDLE", "NO HEAT",
+                                  "NO AC"};
+    if (st > 5) st = 0;
+    uint16_t col = (st == 2 || st == 4 || st == 5) ? UI_RED
+                 : (st == 1) ? UI_GREEN : (st == 3) ? UI_GOLD_D : UI_MUTED;
     rrect(238, 7, 74, 16, col);
     rrect(239, 8, 72, 14, UI_CARD);
     txt_c(275, 12, lbl[st], col, UI_CARD, 1);
@@ -408,7 +418,7 @@ static void draw_home_static(void) {
 
 /* ============================================================== setup page */
 static const char *SET_LABEL[SETUP_ROWS] = {
-    "HEATER", "FAN MODE", "BOX FAN", "KP", "KI", "KD"
+    "HEATER", "FAN MODE", "BOX FAN", "KP", "KI", "KD", "HEATER %"
 };
 
 static void setup_row(uint8_t i, uint8_t selected) {
@@ -423,10 +433,19 @@ static void setup_row(uint8_t i, uint8_t selected) {
     case 2: strcpy(buf, fan2_mute ? "MUTE" : "ON"); break;
     case 3: sprintf(buf, "%d.%d", kp10 / 10, kp10 % 10); break;
     case 4: sprintf(buf, "%d.%02d", ki100 / 100, ki100 % 100); break;
-    default: sprintf(buf, "%d.%d", kd10 / 10, kd10 % 10); break;
+    case 5: sprintf(buf, "%d.%d", kd10 / 10, kd10 % 10); break;
+    default:
+        /* HEATER %: show mode + value. MANUAL overrides PID output. */
+        if (heater_manual)
+            sprintf(buf, "MAN %d%%", heater_manual_pct);
+        else
+            strcpy(buf, "PID AUTO");
+        break;
     }
     txt(16, (int16_t)(y + 11), buf,
-        (i == 2 && fan2_mute) ? UI_RED : (selected ? UI_GOLD : UI_TEXT), bg, 2);
+        (i == 2 && fan2_mute) ? UI_RED :
+        (i == 6 && heater_manual) ? UI_ORANGE :
+        (selected ? UI_GOLD : UI_TEXT), bg, 2);
 
     if (selected) {
         tri(282, (int16_t)(y + 8), 6, 10, UI_GOLD, -1);
@@ -544,6 +563,12 @@ void UI_Init(void) {
     last_sample = HAL_GetTick();
     graph_dirty = 1;
 
+    /* a key pressed to skip the splash is already consumed as an edge turn;
+       drop the "physical press" flag too so the first pass does not act on
+       it (it would otherwise flip a switch behind the user's back) */
+    (void)Key_Left_New();
+    (void)Key_Right_New();
+
     page = PAGE_HOME;
     sel[PAGE_HOME] = sel[PAGE_SETUP] = sel[PAGE_ABOUT] = 0;
     sel_dirty = 1;
@@ -566,6 +591,10 @@ uint8_t UI_GetIron(void) { return Dimmer_GetIron(); }
 uint8_t UI_GetFan(void) { return Fan_GetSpeed(FAN_CH0); }
 uint8_t UI_GetFan2(void) { return Fan_GetSpeed(FAN_CH1); }
 uint8_t UI_GetEnabled(void) { return heater_on; }
+/* Returns 1 if user has switched heater to manual % mode */
+uint8_t UI_GetHeaterManual(void) { return heater_manual; }
+/* Returns the manual heater duty (0..100), valid only when UI_GetHeaterManual()==1 */
+uint8_t UI_GetHeaterManualPct(void) { return heater_manual_pct; }
 
 /* ------------------------------------------------------------------ saving */
 static uint8_t  settings_dirty;
@@ -610,6 +639,32 @@ void UI_HandleKeys(void) {
     uint8_t lf = Key_Left_Pressed();
     uint8_t rt = Key_Right_Pressed();
 
+    /* the physical press only: switches and page changes must fire once per
+       press, never at the auto-repeat rate */
+    uint8_t lf_new = Key_Left_New();
+    uint8_t rt_new = Key_Right_New();
+    uint8_t new_press = (lf_new || rt_new) ? 1 : 0;
+
+    /* The longer the key is held, the bigger the step: x1, then x2 after
+       0.6 s, x5 after 1.5 s and x10 after 3 s (keys.c reports the hold time).
+       Starting the ramp early is what makes 200 C -> 400 C take a second or
+       two instead of 200 taps -- waiting for one single 3 s threshold felt
+       like nothing was happening. */
+    uint32_t hold = 0;
+    if (lf) hold = Key_Left_HoldMs();
+    if (rt) {
+        uint32_t h = Key_Right_HoldMs();
+        if (h > hold) hold = h;
+    }
+    uint8_t stage = (hold >= 3000u) ? 3u : (hold >= 1500u) ? 2u
+                  : (hold >= 600u) ? 1u : 0u;
+    static const int16_t TEMP_STEP[4] = {1, 2, 5, 10};   /* degC per step   */
+    static const int16_t PCT_STEP[4]  = {5, 5, 15, 25};  /* percent         */
+    static const int16_t GAIN_STEP[4] = {1, 1, 2, 5};    /* 0.1 / 0.01 unit */
+
+    /* a held key defers the expensive trend redraw, see UI_Update */
+    keys_busy = (up || dn || lf || rt) ? 1 : 0;
+
     if (up || dn || lf || rt) {
         uint8_t n = (page == PAGE_HOME) ? 5
                   : (page == PAGE_SETUP) ? (SETUP_ROWS + 1) : 1;
@@ -619,28 +674,35 @@ void UI_HandleKeys(void) {
         if (dn) { s = (uint8_t)((s + 1) % n); sel_dirty = 1; }
         sel[page] = s;
 
-        if (lf || rt) {
+        /* Only process L/R if no row-navigation key was also active this pass.
+         * A simultaneous up+lf (e.g. from bounce) would otherwise both move
+         * the cursor AND change the value, causing the double-step the user
+         * reported in the SETTINGS menu. */
+        if ((lf || rt) && !up && !dn) {
             int8_t dir = rt ? 1 : -1;
             if (page == PAGE_HOME) {
                 if (s == 0) {
-                    sp10 = clamp16((int16_t)(sp10 + dir * 10), 0, 5000);
+                    /* setpoint: 1 C per step, 5 C per step once the key is
+                       held past the fast threshold */
+                    sp10 = clamp16((int16_t)(sp10 + dir * 10 * TEMP_STEP[stage]), 0, 5000);
                     mark_dirty();
                 } else if (s == 1) {
-                    Dimmer_SetIron((uint8_t)clamp16((int16_t)((int16_t)Dimmer_GetIron() + dir * 5), 0, 100));
+                    Dimmer_SetIron((uint8_t)clamp16((int16_t)((int16_t)Dimmer_GetIron() + dir * PCT_STEP[stage]), 0, 100));
                     mark_dirty();
                 } else if (s == 2) {
                     Fan_SetSpeed(FAN_CH0,
-                                 (uint8_t)clamp16((int16_t)((int16_t)Fan_GetSpeed(FAN_CH0) + dir * 5), 0, 100));
+                                 (uint8_t)clamp16((int16_t)((int16_t)Fan_GetSpeed(FAN_CH0) + dir * PCT_STEP[stage]), 0, 100));
                     Fan_SetAuto(0);
                     fan_auto = 0;
                     mark_dirty();
                 } else if (s == 3) {
                     /* the 12 V fan on XH501 is clamped by fan.c, keep the UI
                        inside the same window so the bar never lies */
-                    fan2_level = (uint8_t)clamp16((int16_t)((int16_t)fan2_level + dir * 5), 0, FAN_CH1_MAX_PCT);
+                    fan2_level = (uint8_t)clamp16((int16_t)((int16_t)fan2_level + dir * PCT_STEP[stage]), 0, FAN_CH1_MAX_PCT);
                     apply_fan2();
                     mark_dirty();
-                } else {
+                } else if (new_press) {
+                    /* page flip: once per press, not at the repeat rate */
                     page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
                 }
             } else if (page == PAGE_SETUP) {
@@ -649,6 +711,8 @@ void UI_HandleKeys(void) {
                 uint8_t one_row = 1;
                 switch (s) {
                 case 0:
+                    /* switches act on the physical press only */
+                    if (!new_press) { one_row = 0; break; }
                     heater_on = heater_on ? 0 : 1;
                     /* switching on by hand is also the acknowledge of a
                        sensor fault: the user says "try again" */
@@ -657,41 +721,88 @@ void UI_HandleKeys(void) {
                     mark_dirty();
                     break;
                 case 1:
+                    if (!new_press) { one_row = 0; break; }
                     fan_auto = fan_auto ? 0 : 1;
                     Fan_SetAuto(fan_auto);
                     mark_dirty();
                     break;
                 case 2:
                     /* the silent switch: left/right toggles the box fan */
+                    if (!new_press) { one_row = 0; break; }
                     fan2_mute = fan2_mute ? 0 : 1;
                     apply_fan2();
                     mark_dirty();
                     break;
                 case 3:
-                    kp10 = clamp16((int16_t)(kp10 + dir), 0, 200);
+                    kp10 = clamp16((int16_t)(kp10 + dir * GAIN_STEP[stage]), 0, 200);
                     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
                     mark_dirty();
                     break;
                 case 4:
-                    ki100 = clamp16((int16_t)(ki100 + dir), 0, 500);
+                    ki100 = clamp16((int16_t)(ki100 + dir * GAIN_STEP[stage]), 0, 500);
                     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
                     mark_dirty();
                     break;
                 case 5:
-                    kd10 = clamp16((int16_t)(kd10 + dir), 0, 200);
+                    kd10 = clamp16((int16_t)(kd10 + dir * GAIN_STEP[stage]), 0, 200);
                     Control_SetGains((float)kp10 / 10.0f, (float)ki100 / 100.0f, (float)kd10 / 10.0f);
                     mark_dirty();
                     break;
+                case 6:
+                    /* HEATER %: L/R toggles between PID-AUTO and manual.
+                     * In auto: first press switches to manual (new_press only).
+                     * In manual: L/R adjusts duty; a second new_press returns
+                     * to auto and hands control back to the PID. */
+                    if (!heater_manual) {
+                        if (!new_press) { one_row = 0; break; }
+                        heater_manual = 1;
+                        heater_manual_pct = (v_heat > 0) ? v_heat : 10;
+                        Control_SetEnabled(0);  /* PID off, dimmer driven directly */
+                        Dimmer_SetHeater(heater_manual_pct);
+                    } else {
+                        /* already in manual: if it's the very first press
+                         * AND the key went in the "exit" direction, treat it
+                         * as a toggle-back so the user can escape with one tap. */
+                        static uint8_t man_press_count = 0;
+                        if (new_press) man_press_count++;
+                        if (man_press_count >= 1 &&
+                            (heater_manual_pct == 0) && dir < 0 && new_press) {
+                            /* already at 0 and pressing left → exit manual */
+                            heater_manual = 0;
+                            man_press_count = 0;
+                            Control_SetEnabled(heater_on);
+                            Dimmer_SetHeater(0);
+                        } else {
+                            int16_t np = (int16_t)heater_manual_pct + dir * (int16_t)PCT_STEP[stage];
+                            if (np < 0) {
+                                /* hit the floor → exit manual mode */
+                                heater_manual = 0;
+                                man_press_count = 0;
+                                Control_SetEnabled(heater_on);
+                                Dimmer_SetHeater(0);
+                            } else {
+                                heater_manual_pct = (uint8_t)clamp16(np, 0, 95);
+                                Dimmer_SetHeater(heater_manual_pct);
+                            }
+                        }
+                    }
+                    break;
                 default:
-                    page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
                     one_row = 0;
+                    if (!new_press) break;
+                    page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
+                    sel_dirty = 1;
                     break;
                 }
                 if (one_row) setup_row(s, 1);
                 else sel_dirty = 1;
             } else {
-                page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
-                sel_dirty = 1;
+                /* PAGE_ABOUT: only one action = page flip; use new_press to
+                   avoid repeating the flip while the key is held */
+                if (new_press) {
+                    page = (uint8_t)((page + dir + PAGE_COUNT) % PAGE_COUNT);
+                    sel_dirty = 1;
+                }
             }
         }
     }
@@ -715,6 +826,9 @@ void UI_Update(float measured_c, uint8_t heater_pct, uint8_t iron_pct,
     if (v_t10 < 0) v_t10 = 0;
     cur_status = (fault == 2) ? 4 : (fault == 1) ? 2
                : (!heater_on ? 0 : (sp10 == 0 ? 3 : 1));
+    /* a channel is asking for power but no mains edge arrives: the triacs can
+       never be fired, so show it instead of silently doing nothing */
+    if ((v_heat > 0 || v_iron > 0) && !Dimmer_ZcOk()) cur_status = 5;
 
     /* the trend keeps filling while a menu page is open */
     if ((now - last_sample) >= SAMPLE_MS) {
@@ -763,8 +877,13 @@ void UI_Update(float measured_c, uint8_t heater_pct, uint8_t iron_pct,
         if (v_fan2 != last_fan2) { last_fan2 = v_fan2; home_meter(3, v_fan2, s == 3); }
         if (sp10 != last_sp10) { last_sp10 = sp10; home_set_block(s == 0); graph_dirty = 1; }
 
-        if (graph_dirty) {
+        /* One trend redraw per key-repeat tick would cost more than the tick
+           itself over the SPI display, so while a value key is held the graph
+           is refreshed at most every 150 ms; releasing the key repaints it
+           immediately. */
+        if (graph_dirty && (!keys_busy || (now - last_graph_ms) >= 150UL)) {
             graph_dirty = 0;
+            last_graph_ms = now;
             draw_graph();
         }
     } else if (page == PAGE_SETUP) {

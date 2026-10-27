@@ -18,5 +18,8 @@ uint8_t UI_GetFan2(void);
 /* user intent for the heater (the SETUP page switch), not the PID state:
    main.c uses it to restore the heater after an over-temperature trip */
 uint8_t UI_GetEnabled(void);
+/* manual heater override: 1 = user is controlling dimmer directly */
+uint8_t UI_GetHeaterManual(void);
+uint8_t UI_GetHeaterManualPct(void);
 
 #endif

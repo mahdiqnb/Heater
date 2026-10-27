@@ -57,6 +57,7 @@
 /* External variables --------------------------------------------------------*/
 
 /* USER CODE BEGIN EV */
+extern TIM_HandleTypeDef htim3;
 
 /* USER CODE END EV */
 
@@ -140,11 +141,29 @@ void SysTick_Handler(void)
 /* please refer to the startup file (startup_stm32g0xx.s).                    */
 /******************************************************************************/
 
-/* USER CODE BEGIN 1 */
-extern TIM_HandleTypeDef htim3;
+/**
+  * @brief This function handles EXTI line 4 to 15 interrupts.
+  */
+void EXTI4_15_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI4_15_IRQn 0 */
 
+  /* USER CODE END EXTI4_15_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(ZERO_CROSS_Pin);
+  /* USER CODE BEGIN EXTI4_15_IRQn 1 */
+
+  /* USER CODE END EXTI4_15_IRQn 1 */
+}
+
+/* USER CODE BEGIN 1 */
+/* TIM3 is the dimmer's 50 us time base, but it is NOT in the CubeMX timer
+   tree (.ioc), so no handler is generated for it and the vector table still
+   points at the startup file's Default_Handler -- an infinite loop. The
+   firmware then froze 50 us after the timer was started, i.e. before LCD_Init
+   ran at all: that is why the panel stayed white. This block lives inside
+   USER CODE, so "Generate Code" keeps it. */
 void TIM3_IRQHandler(void)
 {
-    HAL_TIM_IRQHandler(&htim3);
+  HAL_TIM_IRQHandler(&htim3);
 }
 /* USER CODE END 1 */

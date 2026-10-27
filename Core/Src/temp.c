@@ -4,7 +4,19 @@
 
 #define SHT40_ADDR (0x44 << 1)
 
-/* INA826 front end, Rg = 330R -> G = 1 + 49.4k/330 = 150.7 */
+/* INA826 front end, Rg = 330R -> G = 1 + 49.4k/330 = 150.7
+ *
+ * HOW TO CALIBRATE:
+ * 1. Put the thermocouple in boiling water (100.0 C at sea level).
+ * 2. Read dbg_adc_mv from the debugger (millivolts at PA0).
+ * 3. At 100 C, K-type EMF = 4.096 mV (from NIST table).
+ * 4. INA_GAIN = dbg_adc_mv / 4.096
+ *    e.g. if dbg_adc_mv = 650 → INA_GAIN = 650/4.096 = 158.7
+ *
+ * Alternatively use the identity:
+ *    INA_GAIN = 1 + 49400 / Rg_actual
+ * Measure Rg with a meter and substitute.
+ */
 #define INA_GAIN  150.7f
 #define ADC_VREF  3.3f
 #define ADC_FULL  4095.0f
@@ -27,6 +39,22 @@ extern I2C_HandleTypeDef hi2c1;
 extern ADC_HandleTypeDef hadc1;
 
 void Temp_Init(void) {
+    /* Acquisition window. The .ioc leaves the common sampling time at the
+       default 1.5 cycles, which is far too short for this front end: the
+       sample-and-hold then captures whatever the triac just coupled into the
+       cable and the reading jumps by a hundred degrees. 39.5 cycles gives a
+       real integration window. Set here (not only in the .ioc) so a CubeMX
+       regenerate cannot undo it. */
+    ADC_ChannelConfTypeDef ch = { 0 };
+    hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_39CYCLES_5;
+    hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_39CYCLES_5;
+    if (HAL_ADC_Init(&hadc1) == HAL_OK) {
+        ch.Channel = ADC_CHANNEL_0;
+        ch.Rank = ADC_REGULAR_RANK_1;
+        ch.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
+        HAL_ADC_ConfigChannel(&hadc1, &ch);
+    }
+
     /* offset/gain calibration is mandatory on STM32G0 before the first
        conversion, otherwise every reading is a few percent off */
     HAL_ADCEx_Calibration_Start(&hadc1);
@@ -83,8 +111,49 @@ static float k_inverse(float mv) {
     return t * mv;
 }
 
+/* A single conversion must not be allowed to jump the display. One count is
+   about 5.3 uV at the input, i.e. roughly 0.14 C, so 60 counts is a step no
+   real thermocouple makes in one 100 ms cycle. */
+#define TC_SPIKE_COUNTS 60
+
+/* ...and no element on this heater moves faster than this either (per 100 ms
+   control cycle, i.e. 100 C/s). Instead of freezing the reading -- which
+   would leave the PID running on a stale value -- the output is slew limited,
+   so a burst is cut down to a small visible step and a real change catches up
+   within a few cycles. */
+#define TC_MAX_STEP_C   10.0f
+
+static uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
+    uint16_t t;
+    if (a > b) { t = a; a = b; b = t; }
+    if (b > c) { t = b; b = c; c = t; }
+    if (a > b) { t = a; a = b; b = t; }
+    return b;
+}
+
+/* newest conversion, unless it is an outlier compared to the previous two:
+   then the median is used. Normal readings pass through untouched, so this
+   adds no lag -- it only removes the one-off spikes. */
+static uint16_t tc_deglitch(void) {
+    static uint16_t hist[3];
+    static uint8_t n;
+    uint16_t raw = tc_average();
+
+    hist[2] = hist[1];
+    hist[1] = hist[0];
+    hist[0] = raw;
+    if (n < 3) n++;
+    if (n < 3) return raw;
+
+    uint16_t med = median3(hist[0], hist[1], hist[2]);
+    int32_t d = (int32_t)raw - (int32_t)med;
+    if (d > TC_SPIKE_COUNTS || d < -TC_SPIKE_COUNTS) return med;
+    return raw;
+}
+
 float Temp_ReadHot(float ambient_c) {
-    float v_tc = (float)tc_average() * ADC_VREF / (ADC_FULL * INA_GAIN);
+    static float last = -1000.0f;
+    float v_tc = (float)tc_deglitch() * ADC_VREF / (ADC_FULL * INA_GAIN);
 
     /* the thermocouple only reports hot minus cold junction, so the EMF of
        the cold junction itself has to be added before the inverse */
@@ -97,5 +166,14 @@ float Temp_ReadHot(float ambient_c) {
 
     float hot = k_inverse(e);
     if (hot < 0.0f) hot = 0.0f;
+
+    /* last line of defence: a jump this large in one cycle is not the element
+       warming up, it is a glitch (loose thermocouple screw, mains burst) */
+    if (last > -100.0f) {
+        if (hot > last + TC_MAX_STEP_C) hot = last + TC_MAX_STEP_C;
+        else if (hot < last - TC_MAX_STEP_C) hot = last - TC_MAX_STEP_C;
+    }
+
+    last = hot;
     return hot;
 }

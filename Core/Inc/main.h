@@ -59,6 +59,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define SW4_Pin GPIO_PIN_0
+#define SW4_GPIO_Port GPIOC
 #define SW3_Pin GPIO_PIN_1
 #define SW3_GPIO_Port GPIOC
 #define SW2_Pin GPIO_PIN_2
@@ -81,6 +83,9 @@ void Error_Handler(void);
 #define CH1_GPIO_Port GPIOB
 #define CH2_Pin GPIO_PIN_6
 #define CH2_GPIO_Port GPIOC
+#define ZERO_CROSS_Pin GPIO_PIN_7
+#define ZERO_CROSS_GPIO_Port GPIOC
+#define ZERO_CROSS_EXTI_IRQn EXTI4_15_IRQn
 #define Ch1_PWM_Pin GPIO_PIN_8
 #define Ch1_PWM_GPIO_Port GPIOC
 #define Ch2_PWM_Pin GPIO_PIN_9

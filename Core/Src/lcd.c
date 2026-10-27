@@ -11,6 +11,28 @@ extern SPI_HandleTypeDef hspi1;
  * Everything below writes the BSRR register directly: HAL_GPIO_WritePin is far
  * too slow when it is called once per SPI bit.
  */
+/* SPI1 is fed from PCLK. The divider is picked from the live clock instead of
+   being hard-coded, so a CubeMX clock-tree change (the tree is 64 MHz now, it
+   used to be 16 MHz) cannot silently push the bus past what the panel accepts.
+   The target is <= 4 MHz: the panel is rated 10 MHz, but this wiring is only
+   proven up to ~8 MHz and a slow correct bus beats a fast broken one. Even at
+   4 MHz a full 320x240 repaint is ~24 ms, which is invisible to the eye.
+   NOTE the index is tbl[i], not tbl[i+1]: an off-by-one here silently picked
+   one step too fast/too slow and is exactly the kind of thing that turns a
+   working panel white. */
+static uint32_t lcd_spi_prescaler(void) {
+    static const uint32_t tbl[8] = {
+        SPI_BAUDRATEPRESCALER_2,   SPI_BAUDRATEPRESCALER_4,
+        SPI_BAUDRATEPRESCALER_8,   SPI_BAUDRATEPRESCALER_16,
+        SPI_BAUDRATEPRESCALER_32,  SPI_BAUDRATEPRESCALER_64,
+        SPI_BAUDRATEPRESCALER_128, SPI_BAUDRATEPRESCALER_256
+    };
+    uint32_t pclk = HAL_RCC_GetPCLK1Freq();
+    uint32_t div = 2, i = 0;
+    while (i < 7u && (pclk / div) > 4000000u) { div <<= 1; i++; }
+    return tbl[i+1];
+}
+
 #define CS_CLR()   ((GPIOA)->BSRR = (uint32_t)GPIO_PIN_3 << 16)
 #define CS_SET()   ((GPIOA)->BSRR = GPIO_PIN_3)
 #define DC_CLR()   ((GPIOA)->BSRR = (uint32_t)GPIO_PIN_5 << 16)
@@ -18,14 +40,64 @@ extern SPI_HandleTypeDef hspi1;
 #define RST_CLR()  ((GPIOA)->BSRR = (uint32_t)GPIO_PIN_4 << 16)
 #define RST_SET()  ((GPIOA)->BSRR = GPIO_PIN_4)
 
+/* bit-bang fallback pins: same two wires, now driven as plain outputs */
+#define SCK_SET()  ((GPIOA)->BSRR = GPIO_PIN_1)
+#define SCK_CLR()  ((GPIOA)->BSRR = (uint32_t)GPIO_PIN_1 << 16)
+#define MOSI_SET() ((GPIOA)->BSRR = GPIO_PIN_2)
+#define MOSI_CLR() ((GPIOA)->BSRR = (uint32_t)GPIO_PIN_2 << 16)
+
+/* 1 = hardware SPI1, 0 = bit-banged. Set once, during LCD_Init. */
+static uint8_t hw_spi = 1;
+
+static void lcd_use_soft_spi(void);
+
+/* Send one byte. If the SPI1 kernel is not clocked (a register write does
+   nothing, SR reads 0) TXE never rises and this loop would hang the boot
+   before the first pixel -- the panel then keeps its random power-on RAM,
+   which is the white screen. The poll is therefore bounded: after ~2000
+   tries the two wires are turned back into plain outputs and every further
+   byte is bit-banged, which is slower but is exactly what the first working
+   firmware on this board did. */
 static inline void spi_tx(uint8_t b) {
-    while ((SPI1->SR & SPI_SR_TXE) == 0U) { }
-    *(volatile uint8_t *)&SPI1->DR = b;
+    if (hw_spi) {
+        uint32_t guard = 2000u;
+        while ((SPI1->SR & SPI_SR_TXE) == 0U) {
+            if (--guard == 0U) {
+                lcd_use_soft_spi();
+                break;
+            }
+        }
+        if (hw_spi) {
+            *(volatile uint8_t *)&SPI1->DR = b;
+            return;
+        }
+    }
+    for (uint8_t i = 0; i < 8u; i++) {
+        if (b & 0x80u) MOSI_SET(); else MOSI_CLR();
+        b = (uint8_t)(b << 1);
+        SCK_SET();
+        SCK_CLR();
+    }
 }
 
 /* wait for the last clocked-out bit to leave the shift register */
 static inline void spi_done(void) {
-    while (SPI1->SR & SPI_SR_BSY) { }
+    uint32_t guard = 100000UL;
+    while ((SPI1->SR & SPI_SR_BSY) != 0U && --guard != 0U) { }
+}
+
+/* Give up on the peripheral: the wires become ordinary GPIOs and the byte
+   stream continues without interruption (no reset, no re-init). */
+static void lcd_use_soft_spi(void) {
+    GPIO_InitTypeDef g = { 0 };
+    hw_spi = 0;
+    g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+    g.Pin = GPIO_PIN_1 | GPIO_PIN_2;
+    HAL_GPIO_Init(GPIOA, &g);
+    SCK_CLR();
+    MOSI_CLR();
 }
 
 /* ---- ILI9341 command/data ---- */
@@ -48,6 +120,41 @@ static void lcd_data(uint8_t d) {
 void LCD_Init(void) {
     GPIO_InitTypeDef g = {0};
 
+    /* BOOT PROBE (temporary): ERR LED (PB12, active-low) turns ON the instant
+       LCD_Init is entered and OFF again once the whole init sequence has been
+       clocked out. This separates the two possible failures:
+         - LED never lights  -> the code never reaches the display, so the real
+           fault is earlier (most likely SystemClock_Config / the 64 MHz PLL)
+           and the panel is a red herring.
+         - LED lights then goes off -> init ran and bytes were clocked out; if
+           the glass is still white the data is not arriving at the panel
+           (wiring / bus speed), not a firmware-order problem. */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    g.Pin = GPIO_PIN_12; /* ERR LED */
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); /* light it */
+
+    /* Full DeInit/Init cycle, exactly like the build that worked: HAL only
+       re-runs HAL_SPI_MspInit() (peripheral clock + PA1/PA2 alternate
+       function) when the handle is in the RESET state, and only DeInit puts
+       it there. Without this the SPI can end up configured but never clocked
+       out, which looks exactly like a white panel. */
+    HAL_SPI_DeInit(&hspi1);
+    /* belt and braces: the clock is enabled here as well, so a HAL handle
+       left in an unexpected state cannot leave the kernel unclocked */
+    __HAL_RCC_SPI1_CLK_ENABLE();
+    hw_spi = 1;
+
+    /* THIS BLOCK MUST STAY. It is not a duplicate of CubeMX's work: the
+       HAL_SPI_DeInit() above put PA1/PA2 back into their reset state and
+       switched the peripheral clock off, and without the lines below the two
+       wires are left floating and the panel receives nothing at all -- the
+       screen stays white, exactly as when this block was commented out.
+       Keeping it here also survives every CubeMX "Generate Code". */
+
     /* CS / RESET / D-C as plain outputs */
     g.Mode = GPIO_MODE_OUTPUT_PP;
     g.Pull = GPIO_NOPULL;
@@ -55,8 +162,9 @@ void LCD_Init(void) {
     g.Pin = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
     HAL_GPIO_Init(GPIOA, &g);
 
-    /* SCK + MOSI on SPI1, 8 MHz (16 MHz / 2). If long wiring shows
-       artefacts, change this to SPI_BAUDRATEPRESCALER_4 (4 MHz). */
+    /* SCK + MOSI on SPI1 (AF0). The ILI9341 is specified to 10 MHz and only
+       tolerates ~15 MHz on short wiring; lcd_spi_prescaler() keeps the bus at
+       or below 9 MHz whatever the system clock is. */
     g.Mode = GPIO_MODE_AF_PP;
     g.Pull = GPIO_NOPULL;
     g.Speed = GPIO_SPEED_FREQ_HIGH;
@@ -67,8 +175,9 @@ void LCD_Init(void) {
     /* Every field is set here on purpose. MX_SPI1_Init() (CubeMX generated)
        comes out with SPI_DATASIZE_4BIT because the .ioc carries no DataSize
        key, and with 4-bit frames the ILI9341 receives garbage for every
-       command -- the panel then stays blank/white. Overriding the whole
-       structure in user code also survives the next CubeMX regenerate. */
+       command -- the panel then stays blank/white. The generated init also
+       leaves the prescaler at /1, i.e. 16 MHz on this clock tree, which is
+       above what this panel reliably accepts. */
     hspi1.Init.Mode = SPI_MODE_MASTER;
     hspi1.Init.Direction = SPI_DIRECTION_2LINES;
     hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
@@ -77,14 +186,32 @@ void LCD_Init(void) {
     hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
     hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+    hspi1.Init.BaudRatePrescaler = lcd_spi_prescaler();
     hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-    HAL_SPI_Init(&hspi1);   /* rewrites CR1/CR2 and disables the peripheral */
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) {   /* rewrites CR1/CR2, disables the kernel */
+        /* the driver refuses a handle that is not in its RESET state: force a
+           fresh MspInit (peripheral clock + PA1/PA2 alternate function) */
+        hspi1.State = HAL_SPI_STATE_RESET;
+        if (HAL_SPI_Init(&hspi1) != HAL_OK)
+            lcd_use_soft_spi();
+    }
     __HAL_SPI_CLEAR_OVRFLAG(&hspi1);
     __HAL_SPI_ENABLE(&hspi1);
 
     CS_SET();
+
+    /* Probe the block before it is used for real. A byte clocked out with CS
+       high is ignored by the panel, but it proves that TXE answers; if it does
+       not, spi_tx() has already switched the same wires to bit-banging, so the
+       init sequence below still reaches the panel. */
+    DC_SET();
+    spi_tx(0x00);
+    spi_done();
+
+    /* let VCC settle after power on before the first reset: at 50 MHz the
+       firmware reaches this point much sooner than it used to */
+    HAL_Delay(50);
 
     /* reset */
     RST_CLR();
@@ -148,6 +275,8 @@ void LCD_Init(void) {
     HAL_Delay(150);
     lcd_cmd(0x29); /* display on */
     HAL_Delay(50);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); /* init done: LED off */
 }
 
 /* ---- drawing ---- */
