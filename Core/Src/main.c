@@ -179,6 +179,12 @@ int main(void) {
 	gi.Pin = CH2_Pin;
 	HAL_GPIO_Init(CH2_GPIO_Port, &gi);
 
+	/* LEDs are active-LOW, so HIGH = off. Repeated here (not only in the
+	   generated MX_GPIO_Init) because CubeMX would otherwise restore the old
+	   RESET level and every LED would light during the splash. */
+	HAL_GPIO_WritePin(GPIOB, ERR_LED_Pin | CH1_LED_Pin | CH2_LED_Pin,
+			GPIO_PIN_SET);
+
 	/* keys PC0..PC3: internal pull-ups, a floating pin must never look like a
 	 press */
 	gi.Pin = GPIO_PIN_0 | SW3_Pin | SW2_Pin | SW1_Pin;
