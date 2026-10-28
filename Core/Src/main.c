@@ -168,17 +168,17 @@ int main(void) {
 	gi.Pin = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
 	HAL_GPIO_Init(GPIOA, &gi);
 
-	/* The two triac gate signals (PB15 = CH1, PC6 = CH2) must be ordinary GPIO
-	 outputs. If CubeMX puts them back on a timer channel they become
-	 alternate-function pins, HAL_GPIO_WritePin() stops reaching the MOC3021
-	 and neither channel fires at all. */
-	HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
+	/* The two triac gate signals (CH1 = PC6, CH2 = PB15 on this build) must be
+	 ordinary GPIO outputs. If CubeMX puts them back on a timer channel they
+	 become alternate-function pins, HAL_GPIO_WritePin() stops reaching the
+	 MOC3021 and neither channel fires at all. */
+
 	gi.Pin = CH1_Pin;
 	HAL_GPIO_Init(CH1_GPIO_Port, &gi);
 	gi.Pin = CH2_Pin;
 	HAL_GPIO_Init(CH2_GPIO_Port, &gi);
-
+	HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
 	/* LEDs are active-LOW, so HIGH = off. Repeated here (not only in the
 	   generated MX_GPIO_Init) because CubeMX would otherwise restore the old
 	   RESET level and every LED would light during the splash. */
@@ -256,6 +256,8 @@ int main(void) {
 	Control_Init();
 	UI_Init();
 
+	HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_RESET);
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -275,12 +277,25 @@ int main(void) {
 		UI_HandleKeys();
 
 		/* the SHT40 needs ~9 ms for a conversion, so once a second is plenty;
-		 a failed read keeps the last good value */
+		 a failed read keeps the last good value. A single I2C frame can
+		 still come back corrupt, and the cold-junction term feeds every
+		 temperature reading, so a value that jumps more than 5 C in one
+		 second is ignored. Five such readings in a row means the ambient
+		 really did change (or the sensor was just powered), so the filter
+		 re-primes instead of locking itself out for ever. */
 		if ((now - t_amb) >= 1000UL) {
+			static uint8_t amb_bad;
 			t_amb = now;
 			float amb_try;
-			if (Temp_ReadAmbient(&amb_try) == 0)
-				amb = amb_try;
+			if (Temp_ReadAmbient(&amb_try) == 0 && amb_try > -40.0f
+					&& amb_try < 100.0f) {
+				if (amb_try > amb + 5.0f || amb_try < amb - 5.0f) {
+					if (++amb_bad >= 5) { amb = amb_try; amb_bad = 0; }
+				} else {
+					amb_bad = 0;
+					amb += 0.2f * (amb_try - amb);
+				}
+			}
 		}
 
 		/* the thermal loop runs on its own 100 ms grid, independent of how
@@ -313,16 +328,16 @@ int main(void) {
 				/* millivolts at PA0: count/4095 * 3300mV */
 				dbg_adc_mv = (uint16_t)((uint32_t)dbg_adc_filt * 3300UL / 4095UL);
 
-				/* EMF at thermocouple wires in µV:
-				 *   PA0_mv / INA_GAIN = amplifier input (= TC hot-cold EMF)
+				/* EMF at thermocouple wires in uV:
+				 *   PA0_mv -> subtract the 7 mV front-end offset -> / INA_GAIN
+				 *            = amplifier input (= TC hot-cold EMF)
 				 *   + cold junction EMF (from SHT40 ambient reading)
-				 * INA_GAIN = 150.7 (Rg=330R, G = 1 + 49.4k/330)
-				 * Compare dbg_tc_emf_uv against a K-type reference table:
-				 *   25°C → 1000 µV,  100°C → 4096 µV,  200°C → 8138 µV
-				 * If the reading is too high compared to real temperature,
-				 * the actual gain is lower than 150.7 (Rg might be higher). */
+				 * INA_GAIN and TC_OFFSET_MV come from temp.h and are the
+				 * values measured on this board (25C->7mV, 450C->1250mV),
+				 * NOT the schematic's nominal 150.7. Compare dbg_tc_emf_uv
+				 * against K-type: 100C->4096uV, 200C->8138uV, 450C->18550uV. */
 				float v_pa0_mv = (float)dbg_adc_filt * 3300.0f / 4095.0f;
-				float tc_emf_mv = v_pa0_mv / 150.7f;   /* INA_GAIN */
+				float tc_emf_mv = (v_pa0_mv - TC_OFFSET_MV) / INA_GAIN;
 				/* add cold-junction EMF (µV) */
 				float cj_mv = 0.03970f * amb + 1.21e-5f * amb * amb;
 				dbg_tc_emf_uv = (int32_t)((tc_emf_mv + cj_mv) * 1000.0f);
@@ -354,16 +369,17 @@ int main(void) {
 			} else {
 				if (overtemp == 2)
 					overtemp = 0;
-				/* The setpoint-relative limit only applies while the heater is
-				 armed: with setpoint 0 a warm (>40C) residual temperature must
-				 not raise ERR. The absolute 520C limit always applies.
+				/* A setpoint at or below HEATER_MIN_SP_C (25.0 C) means "OFF":
+				 the heater must not be treated as armed, otherwise a warm
+				 residual temperature would raise ERR while the user has it
+				 switched off. The absolute 520C limit always applies.
 				 *
 				 * A single 100 ms sample can still jump on a mains burst even
 				 * after the filtering in temp.c, and tripping on one sample
 				 * turns a transient into a visible fault. Three consecutive
 				 * cycles above the limit are required; a real over-temperature
 				 * still stops the element within 300 ms. */
-				if ((Control_GetEnabled() && sp > 0.0f && hot > sp + 40.0f)
+				if ((Control_GetEnabled() && sp > HEATER_MIN_SP_C && hot > sp + 40.0f)
 						|| hot > 520.0f) {
 					if (overtemp_cnt < 3)
 						overtemp_cnt++;
@@ -871,8 +887,8 @@ static void MX_GPIO_Init(void) {
 
 	/*Configure GPIO pin : CH2_Pin (triac gate, plain output)
 	 * The Pin field must be rewritten: the previous call left CH1_Pin in it,
-	 * so CH2 (PC6) was never configured as an output and the iron gate stayed
-	 * in its reset state. */
+	 * so CH2 (PB15) was never configured as an output and the iron gate
+	 * stayed in its reset state. */
 	GPIO_InitStruct.Pin = CH2_Pin;
 	HAL_GPIO_Init(CH2_GPIO_Port, &GPIO_InitStruct);
 

@@ -28,7 +28,9 @@ void Settings_Load(settings_t *s) {
         s->kd_x10 = 10;   /* 1.0  */
     }
     /* sanity-check what came out of flash before it drives the heater */
-    if (s->setpoint_x10 < 0 || s->setpoint_x10 > 5000) s->setpoint_x10 = 2000;
+    /* the floor is 25.0 C: below that the heater is OFF (see ui.h) */
+    if (s->setpoint_x10 < 250) s->setpoint_x10 = 250;
+    if (s->setpoint_x10 > 5000) s->setpoint_x10 = 2000;
     if (s->iron_pct > 100) s->iron_pct = 50;
     if (s->fan_pct > 100) s->fan_pct = 50;
     if (s->fan2_pct > FAN_CH1_MAX_PCT) s->fan2_pct = FAN_CH1_MAX_PCT;

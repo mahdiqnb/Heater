@@ -84,10 +84,10 @@ void Error_Handler(void);
 #define CH1_LED_GPIO_Port GPIOB
 #define ERR_LED_Pin GPIO_PIN_14
 #define ERR_LED_GPIO_Port GPIOB
-#define CH1_Pin GPIO_PIN_15
-#define CH1_GPIO_Port GPIOB
-#define CH2_Pin GPIO_PIN_6
-#define CH2_GPIO_Port GPIOC
+#define CH1_Pin GPIO_PIN_6
+#define CH1_GPIO_Port GPIOC
+#define CH2_Pin GPIO_PIN_15
+#define CH2_GPIO_Port GPIOB
 #define ZERO_CROSS_Pin GPIO_PIN_7
 #define ZERO_CROSS_GPIO_Port GPIOC
 #define ZERO_CROSS_EXTI_IRQn EXTI4_15_IRQn

@@ -329,8 +329,13 @@ static void home_set_block(uint8_t selected) {
     rrect(9, 99, 158, 29, selected ? UI_GOLD : UI_EDGE);
     rrect(10, 100, 156, 27, bg);
     txt(16, 104, "SET", selected ? UI_GOLD_D : UI_MUTED, bg, 1);
-    sprintf(buf, "%d.%d C", sp10 / 10, sp10 % 10);
-    txt_r(158, 107, buf, selected ? UI_GOLD : UI_TEXT, bg, 2);
+    /* 25.0 C and below is not a temperature, it is "off" */
+    if (sp10 <= HEATER_MIN_SP_X10)
+        strcpy(buf, "OFF");
+    else
+        sprintf(buf, "%d.%d C", sp10 / 10, sp10 % 10);
+    txt_r(158, 107, buf, (sp10 <= HEATER_MIN_SP_X10) ? UI_RED
+        : (selected ? UI_GOLD : UI_TEXT), bg, 2);
 }
 
 static void home_meter(uint8_t idx, uint8_t pct, uint8_t selected) {
@@ -544,6 +549,8 @@ void UI_Splash(void) {
 void UI_Init(void) {
     Settings_Load(&cfg);
     sp10 = cfg.setpoint_x10;
+    /* older records could hold anything; 25.0 C is the OFF floor */
+    if (sp10 < HEATER_MIN_SP_X10) sp10 = HEATER_MIN_SP_X10;
     heater_on = cfg.enabled ? 1 : 0;
     fan_auto = cfg.fan_auto ? 1 : 0;
     kp10 = cfg.kp_x10;
@@ -685,8 +692,10 @@ void UI_HandleKeys(void) {
             if (page == PAGE_HOME) {
                 if (s == 0) {
                     /* setpoint: 1 C per step, 5 C per step once the key is
-                       held past the fast threshold */
-                    sp10 = clamp16((int16_t)(sp10 + dir * 10 * TEMP_STEP[stage]), 0, 5000);
+                       held past the fast threshold. The floor is
+                       HEATER_MIN_SP_X10: at 25.0 C the heater is OFF, so the
+                       value must never fall below it. */
+                    sp10 = clamp16((int16_t)(sp10 + dir * 10 * TEMP_STEP[stage]), HEATER_MIN_SP_X10, 5000);
                     mark_dirty();
                 } else if (s == 1) {
                     Dimmer_SetIron((uint8_t)clamp16((int16_t)((int16_t)Dimmer_GetIron() + dir * PCT_STEP[stage]), 0, 100));
@@ -831,7 +840,8 @@ void UI_Update(float measured_c, uint8_t heater_pct, uint8_t iron_pct,
        RUN instead of STOP. */
     cur_status = (fault == 2) ? 4 : (fault == 1) ? 2
                : (heater_manual ? 1
-               : (!heater_on ? 0 : (sp10 == 0 ? 3 : 1)));
+               : (!heater_on ? 0
+               : (sp10 <= HEATER_MIN_SP_X10 ? 3 : 1)));
     /* a channel is asking for power but no mains edge arrives: the triacs can
        never be fired, so show it instead of silently doing nothing */
     if ((v_heat > 0 || v_iron > 0) && !Dimmer_ZcOk()) cur_status = 5;

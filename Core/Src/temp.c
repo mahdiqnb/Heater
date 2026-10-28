@@ -4,20 +4,23 @@
 
 #define SHT40_ADDR (0x44 << 1)
 
-/* INA826 front end, Rg = 330R -> G = 1 + 49.4k/330 = 150.7
+/* INA826 front end, measured on the real board:
+ *    25 C  -> 7.0 mV at PA0 (both junctions at 25 C, so the whole 7.0 mV is
+ *             the amplifier output offset)
+ *    450 C -> 1250 mV at PA0 (K-type EMF hot-cold = E(450)-E(25) =
+ *             18.456 - 0.979 = 17.477 mV)
+ *    => G = (1250 - 7) / 17.477 = 71.12, offset = 7.0 mV
+ * The schematic's Rg = 330R implies G = 150.7, which read ~219 C at a real
+ * 450 C: that is what made the PID chase an unreachable setpoint and the LCD
+ * show a temperature that had nothing to do with the iron.
  *
- * HOW TO CALIBRATE:
+ * HOW TO RE-CALIBRATE:
  * 1. Put the thermocouple in boiling water (100.0 C at sea level).
  * 2. Read dbg_adc_mv from the debugger (millivolts at PA0).
- * 3. At 100 C, K-type EMF = 4.096 mV (from NIST table).
- * 4. INA_GAIN = dbg_adc_mv / 4.096
- *    e.g. if dbg_adc_mv = 650 → INA_GAIN = 650/4.096 = 158.7
- *
- * Alternatively use the identity:
- *    INA_GAIN = 1 + 49400 / Rg_actual
- * Measure Rg with a meter and substitute.
+ * 3. K-type EMF at 100 C = 4.096 mV (NIST); cj_mv for the ambient is
+ *    0.03970*amb + 1.21e-5*amb^2.
+ * 4. INA_GAIN = (dbg_adc_mv - TC_OFFSET_MV) / (4.096 - cj_mv).
  */
-#define INA_GAIN  150.7f
 #define ADC_VREF  3.3f
 #define ADC_FULL  4095.0f
 
@@ -41,13 +44,24 @@
 #define CJ_A      0.03970f
 #define CJ_B      1.21e-5f
 
-/* upper end of the inverse polynomial. The ADC saturates at 527 C
-   (3.3V / 150.7 = 21.85 mV), so anything up to 22 mV is inside the useful
-   range of the curve. */
-#define E_MAX_MV  22.0f
+/* Upper end of the inverse polynomial: it is the NITS 0..500 C fit, so it is
+   only trusted up to E(500 C) = 20.64 mV. The ADC rails at a much higher
+   equivalent temperature now ((3300-7)/71.12 = 46.3 mV), so this cap exists
+   purely to keep the polynomial from being evaluated out of range. */
+#define E_MAX_MV  20.64f
 
 extern I2C_HandleTypeDef hi2c1;
 extern ADC_HandleTypeDef hadc1;
+
+/* --- SHT40 debug globals: watch these live in the debugger (Live Expressions) ---
+   g_sht_temp_c : last temperature read from the SHT40, degC
+   g_sht_humi_rh : last relative humidity read from the SHT40, %RH
+   g_sht_ok     : 1 = the last transaction succeeded
+   g_sht_err    : number of failed I2C transactions since power-on */
+volatile float    g_sht_temp_c = 0.0f;
+volatile float    g_sht_humi_rh = 0.0f;
+volatile uint8_t  g_sht_ok = 0;
+volatile uint16_t g_sht_err = 0;
 
 void Temp_Init(void) {
     /* Acquisition window. The .ioc leaves the common sampling time at the
@@ -83,13 +97,33 @@ uint16_t Temp_ReadADC(void) {
 }
 
 uint8_t Temp_ReadAmbient(float *amb) {
-    uint8_t cmd = 0xFD; /* high repeatability, ~8.3 ms conversion */
-    if (HAL_I2C_Master_Transmit(&hi2c1, SHT40_ADDR, &cmd, 1, 50) != HAL_OK) return 1;
+    uint8_t cmd = 0xFD; /* single shot, high repeatability, ~8.3 ms conversion */
+    if (HAL_I2C_Master_Transmit(&hi2c1, SHT40_ADDR, &cmd, 1, 50) != HAL_OK) {
+        g_sht_ok = 0;
+        g_sht_err++;
+        return 1;
+    }
     HAL_Delay(10);
     uint8_t buf[6];
-    if (HAL_I2C_Master_Receive(&hi2c1, SHT40_ADDR, buf, 6, 50) != HAL_OK) return 1;
+    if (HAL_I2C_Master_Receive(&hi2c1, SHT40_ADDR, buf, 6, 50) != HAL_OK) {
+        g_sht_ok = 0;
+        g_sht_err++;
+        return 1;
+    }
     uint16_t traw = (uint16_t)((buf[0] << 8) | buf[1]);
-    *amb = -45.0f + 175.0f * (float)traw / 65535.0f;
+    uint16_t hraw = (uint16_t)((buf[3] << 8) | buf[4]);
+
+    float t = -45.0f + 175.0f * (float)traw / 65535.0f;
+    float rh = -6.0f + 125.0f * (float)hraw / 65535.0f;
+    if (rh < 0.0f) rh = 0.0f;
+    if (rh > 100.0f) rh = 100.0f;
+
+    /* publish to the debug globals */
+    g_sht_temp_c = t;
+    g_sht_humi_rh = rh;
+    g_sht_ok = 1;
+
+    *amb = t;
     return 0;
 }
 
@@ -125,20 +159,11 @@ static float k_inverse(float mv) {
 }
 
 /* A single conversion must not be allowed to jump the display. One count is
-   about 5.3 uV at the input, i.e. roughly 0.14 C, so 200 counts (~28 C) is
+   about 5.3 uV at the input, i.e. roughly 0.14 C, so 80 counts (~11 C) is
    a step no real thermocouple makes in one 100 ms cycle due to conduction.
-   Raised from the original 60 so fast-heating elements are not artificially
-   slowed down. Real mains-burst spikes are still caught by tc_deglitch(). */
-#define TC_SPIKE_COUNTS 200
-
-/* Maximum temperature change the output is allowed to follow per 100 ms
-   control cycle. The element can heat at >30 C/s when at full power, so
-   50 C/cycle (= 500 C/s) is high enough to track real heating while still
-   rejecting single-cycle glitches from a loose thermocouple screw.
-   The original 10 C/cycle (100 C/s) was too conservative: it caused the
-   displayed temperature to lag ~10 s behind reality at full power, making
-   the PID overshoot badly because it thought the element was still cold. */
-#define TC_MAX_STEP_C   50.0f
+   Real mains-burst spikes are still caught here, and anything that survives
+   is clamped again by tc_smooth() before it reaches the display. */
+#define TC_SPIKE_COUNTS 80
 
 static uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
     uint16_t t;
@@ -168,13 +193,57 @@ static uint16_t tc_deglitch(void) {
     return raw;
 }
 
+/* ------------------------------------------------------------------ filters */
+/* Clamp-then-average. Every sample is first clamped to +/-OUTLIER_TOL_C
+   around the current window mean and only then pushed into the moving
+   average. A single huge glitch therefore moves the mean by at most
+   OUTLIER_TOL_C/MA_LEN instead of dragging the whole display with it, while
+   a real ramp still passes through almost unchanged (each sample is only
+   clamped by the distance the element can physically travel). The output is
+   additionally held inside DISP_HYST_C so a quiet reading does not flicker. */
+#define MA_LEN        8       /* moving-average window (samples) */
+#define OUTLIER_TOL_C 30.0f   /* max believable change vs. the window mean */
+#define DISP_HYST_C   0.5f    /* output dead-band */
+
+static float tc_smooth(float cand) {
+    static float buf[MA_LEN];
+    static float sum;
+    static uint8_t idx;
+    static uint8_t primed;
+    static float disp;
+
+    if (!primed) {
+        for (uint8_t i = 0; i < MA_LEN; i++) buf[i] = cand;
+        sum  = cand * (float)MA_LEN;
+        disp = cand;
+        primed = 1;
+        return cand;
+    }
+
+    /* reject the impossible part of the sample before it enters the window */
+    float mean = sum / (float)MA_LEN;
+    if (cand > mean + OUTLIER_TOL_C) cand = mean + OUTLIER_TOL_C;
+    if (cand < mean - OUTLIER_TOL_C) cand = mean - OUTLIER_TOL_C;
+
+    sum -= buf[idx];
+    buf[idx] = cand;
+    sum += cand;
+    if (++idx >= MA_LEN) idx = 0;
+
+    float f = sum / (float)MA_LEN;
+    if (f > disp + DISP_HYST_C || f < disp - DISP_HYST_C) disp = f;
+    return disp;
+}
+
 float Temp_ReadHot(float ambient_c) {
-    static float last = -1000.0f;
-    float v_tc = (float)tc_deglitch() * ADC_VREF / (ADC_FULL * INA_GAIN);
+    /* front end: raw counts -> PA0 millivolts -> subtract the measured 7 mV
+       amplifier offset -> divide by the measured gain to recover the
+       hot-minus-cold thermocouple EMF in mV. */
+    float pa0_mv = (float)tc_deglitch() * ADC_VREF * 1000.0f / ADC_FULL;
+    float e = (pa0_mv - TC_OFFSET_MV) / INA_GAIN;
 
     /* the thermocouple only reports hot minus cold junction, so the EMF of
        the cold junction itself has to be added before the inverse */
-    float e = v_tc * 1000.0f;
     if (ambient_c > -40.0f && ambient_c < 100.0f) {
         e += CJ_A * ambient_c + CJ_B * ambient_c * ambient_c;
     }
@@ -184,13 +253,6 @@ float Temp_ReadHot(float ambient_c) {
     float hot = k_inverse(e);
     if (hot < 0.0f) hot = 0.0f;
 
-    /* last line of defence: a jump this large in one cycle is not the element
-       warming up, it is a glitch (loose thermocouple screw, mains burst) */
-    if (last > -100.0f) {
-        if (hot > last + TC_MAX_STEP_C) hot = last + TC_MAX_STEP_C;
-        else if (hot < last - TC_MAX_STEP_C) hot = last - TC_MAX_STEP_C;
-    }
-
-    last = hot;
-    return hot;
+    /* clamp + moving average + output hysteresis live in tc_smooth() */
+    return tc_smooth(hot);
 }

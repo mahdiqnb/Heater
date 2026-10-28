@@ -2,6 +2,13 @@
 #define UI_H
 #include <stdint.h>
 
+/* Setpoints at or below this mean "heater OFF": the control loop stays shut
+   down and the LCD shows OFF instead of a temperature. 25.0 C is room
+   temperature, so the element is never asked to heat to something the
+   ambient already is. */
+#define HEATER_MIN_SP_C   25.0f
+#define HEATER_MIN_SP_X10 250   /* the same value in 0.1 degC units */
+
 void UI_Splash(void);   /* boot logo; blocks for a couple of seconds */
 void UI_Init(void);
 

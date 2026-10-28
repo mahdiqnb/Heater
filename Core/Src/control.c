@@ -17,6 +17,13 @@
 /* low pass on the derivative: the raw dT/dt of a 12-bit reading is useless */
 #define DERIV_TAU_S    1.5f
 
+/* P/I dead-band. Inside +/- this many degC of the setpoint the error is
+   treated as zero, so the residual ADC/filter noise cannot keep swinging the
+   duty between full and off (the "heater chatter" seen on the LCD). The
+   integrator therefore holds its last value and only the D term still reacts
+   to real movement, which is what keeps the loop from overshooting. */
+#define CTRL_DEADBAND_C 2.0f
+
 /* Protection: this much demand for this long must put the measured
    temperature clearly above the SHT40 ambient. A disconnected or shorted
    thermocouple reads "room temperature" for ever, and a broken element never
@@ -28,6 +35,10 @@
 #define RUNAWAY_ERR_C    15.0f
 #define RUNAWAY_DELTA_C  5.0f
 #define ABS_MAX_C       520.0f
+
+/* Room temperature means "off": a setpoint at or below 25.0 C never drives
+   the element. This matches the UI, which shows OFF below the same value. */
+#define SP_OFF_C        25.0f
 
 static float kp = KP_DEF, ki = KI_DEF, kd = KD_DEF;
 static float integ;        /* % output, 0..100 */
@@ -116,7 +127,7 @@ void Control_Update(float measured_c, float setpoint_c, float ambient_c) {
         return;
     }
 
-    if (!enabled || fault != CTRL_FAULT_NONE || setpoint_c <= 0.0f) {
+    if (!enabled || fault != CTRL_FAULT_NONE || setpoint_c <= SP_OFF_C) {
         shut_down();
         prev_meas = measured_c;
         primed = 1;
@@ -124,6 +135,10 @@ void Control_Update(float measured_c, float setpoint_c, float ambient_c) {
     }
 
     float err = setpoint_c - measured_c;
+
+    /* dead-band: hold P and I inside +/-CTRL_DEADBAND_C so sensor noise does
+       not modulate the duty. D below still sees the real measurement. */
+    if (err < CTRL_DEADBAND_C && err > -CTRL_DEADBAND_C) err = 0.0f;
 
     /* ---- D: derivative of the measurement, not of the error, so a setpoint
        change does not kick the triac ---- */
