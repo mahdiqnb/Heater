@@ -185,7 +185,7 @@ void Control_Update(float measured_c, float setpoint_c, float ambient_c) {
     heater_pct = (uint8_t)(out + 0.5f);
     out_prev = out;
     prev_meas = measured_c;
-    Dimmer_SetHeater(heater_pct);
+    Dimmer_SetHeaterFine(out);
 
     /* ---- runaway / open sensor detector ---- */
     if (heater_pct >= RUNAWAY_DUTY && err > RUNAWAY_ERR_C) {
@@ -207,3 +207,7 @@ void Control_Update(float measured_c, float setpoint_c, float ambient_c) {
 }
 
 uint8_t Control_GetHeaterPercent(void) { return heater_pct; }
+
+/* Fine output (0..100 %, not rounded). main.c uses this to drive the dimmer,
+ * so the loop is not limited to whole-percent steps. */
+float Control_GetHeaterDuty(void) { return out_prev; }

@@ -414,15 +414,16 @@ int main(void) {
 		 * in agreement. Before, the UI and the LED showed the PID output
 		 * while the dimmer was driven by the manual value, so a manual
 		 * percentage looked as if it did nothing. */
-		uint8_t heater_pct;
+		float heater_duty;
 		if (overtemp) {
-			heater_pct = 0;
+			heater_duty = 0.0f;
 		} else if (UI_GetHeaterManual()) {
-			heater_pct = UI_GetHeaterManualPct();
+			heater_duty = (float)UI_GetHeaterManualPct();
 		} else {
-			heater_pct = Control_GetHeaterPercent();
+			heater_duty = Control_GetHeaterDuty();
 		}
-		Dimmer_SetHeater(heater_pct);
+		Dimmer_SetHeaterFine(heater_duty);
+		uint8_t heater_pct = (uint8_t)(heater_duty + 0.5f);
 
 		/* In AUTO the heater fan follows the heater (manual included, so a
 		   manual duty cannot cook the element with no airflow); the aux fan
@@ -900,7 +901,7 @@ static void MX_GPIO_Init(void) {
 	 * The board already has an external 10 k pull-up on the collector, so the
 	 * internal one is redundant and is left off. */
 	GPIO_InitStruct.Pin = ZERO_CROSS_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	HAL_GPIO_Init(ZERO_CROSS_GPIO_Port, &GPIO_InitStruct);
 

@@ -11,6 +11,7 @@ void Control_Init(void);
    ambient_c is the SHT40 reading and is only used by the sensor check */
 void Control_Update(float measured_c, float setpoint_c, float ambient_c);
 uint8_t Control_GetHeaterPercent(void);
+float Control_GetHeaterDuty(void);
 void Control_SetEnabled(uint8_t en);
 uint8_t Control_GetEnabled(void);
 void Control_SetGains(float p, float i, float d);

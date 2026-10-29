@@ -45,6 +45,21 @@
  * Same logic as heater, but iron works fine up to 94%, so threshold is 95. */
 #define IRON_FULLON_PCT       95u
 
+/* Below this duty CH1 is switched by whole half-cycles ("burst firing")
+ * instead of phase-angle. At 2 % the phase-angle delay is 192 of 200 ticks, so
+ * the conduction window is only 400 us and a one-tick jitter of the zero-cross
+ * reference changes the delivered power by ~20 %. That is what made a constant
+ * 2.00 % request wander over a 30 C band. A burst half-cycle is either fully on
+ * or fully off, so its energy is exact; 100 half-cycles per second against a
+ * ~20 s thermal time constant averages the bursts into a smooth temperature.
+ * Above this duty the conduction window is wide enough for phase-angle. */
+#define HEATER_BURST_MAX_DQ   2000u   /* 20.00 % */
+
+/* Gate is held this long at the start of a burst half-cycle. The triac latches
+ * in microseconds; 1 ms is plenty and stops well before the next zero-cross,
+ * so the gate can never spill over and fire an extra half-cycle. */
+#define BURST_GATE_TICKS      20u
+
 /* Gate pulse width for phase-control range (0 .. HEATER_FULLON_PCT-1).
  * MOC3021 needs >=10 us; 3 ticks = 150 us is reliable and short enough not
  * to overlap the next ZC event. */
@@ -56,8 +71,18 @@ static volatile uint32_t half_start   = 0;  /* tick of the current half-cycle */
 static volatile uint32_t last_zc_tick = 0;  /* last accepted zero-cross       */
 static volatile uint8_t  synced       = 0;  /* 1 = mains phase is known       */
 
-static volatile uint8_t  heater_pct   = 0;
 static volatile uint8_t  iron_pct     = 0;
+
+/* CH1 duty in 0.01 % units (0..10000). Keeping it finer than one percent is
+ * what lets the PID settle on a temperature: on this plant one percent of
+ * duty is worth tens of degrees, so a 1 % grid forces a limit cycle of that
+ * amplitude no matter how the gains are chosen. */
+static volatile uint16_t heater_dq    = 0;
+/* fractional part of the firing delay, carried from one half-cycle to the
+ * next (ISR only) */
+static uint16_t          heat_dither  = 0;
+/* burst-firing accumulator: how much of a half-cycle is "owed" (ISR only) */
+static uint16_t          heat_burst_acc = 0;
 
 static volatile uint32_t fire1        = 0, fire2    = 0;
 static volatile uint8_t  armed1       = 0, armed2   = 0;
@@ -98,11 +123,66 @@ static uint32_t RmsDelayTicks(uint8_t percent) {
     return (uint32_t)rms_delay_ticks[percent];
 }
 
+/* Fine-duty version of RmsDelayTicks() for CH1.
+ *
+ * The table only has an entry per whole percent, and one percent of duty is
+ * worth tens of degrees here, so using it directly leaves the PID with a
+ * coarse quantised actuator. Instead the delay is linearly interpolated
+ * between the two neighbouring entries and the leftover fraction of a tick is
+ * carried in a delta-sigma accumulator: a request of, say, 1.37 % fires at
+ * 193 ticks on 63 % of the half-cycles and at 194 on the other 37 %. The
+ * average firing angle - and therefore the average power - then follows the
+ * request continuously, while each individual half-cycle is still a normal
+ * phase-angle burst. 100 half-cycles per second is far faster than the
+ * thermal time constant, so the modulation is invisible on the tip.
+ *
+ * The delay is limited to HALF_PERIOD_TICKS-1 so a gate pulse can never spill
+ * into the next half-cycle and fire the triac at full conduction. */
+static uint32_t HeaterDelayTicks(void) {
+    uint16_t dq = heater_dq;
+    if (dq == 0) return HALF_PERIOD_TICKS;
+
+    uint32_t pct = dq / 100u;
+    uint32_t rem = dq % 100u;
+    uint32_t d0  = rms_delay_ticks[pct];
+    uint32_t d1  = rms_delay_ticks[pct + 1u];
+
+    /* delay in 1/100 tick, then split into whole ticks and a remainder */
+    uint32_t q     = d0 * 100u - (d0 - d1) * rem;
+    uint32_t whole = q / 100u;
+    uint32_t frac  = q % 100u;
+
+    heat_dither += (uint16_t)frac;
+    if (heat_dither >= 100u) {
+        heat_dither -= 100u;
+        whole++;
+    }
+    if (whole >= HALF_PERIOD_TICKS) whole = HALF_PERIOD_TICKS - 1u;
+    return whole;
+}
+
+/* End of a gate pulse, clipped so it stops at the half-cycle boundary. */
+static uint32_t gate_end(uint32_t now) {
+    uint32_t end = now + GATE_PULSE_TICKS;
+    uint32_t limit = half_start + HALF_PERIOD_TICKS;
+    if (end > limit) end = limit;
+    return end;
+}
+
 /* --------------------------------------------------------- half scheduling -
  * Arm both channels for the half-cycle that starts at dim_tick.
  * Called from the timer ISR and from the zero-cross ISR, which share one
  * NVIC priority, so the two can never nest. */
 static void schedule_half(void) {
+    /* The zero-cross handler and the tick ISR can both reach here for the same
+     * crossing. Scheduling twice would advance the fine-duty dither twice and
+     * bias the average power, so remember which half-cycle was already set up. */
+    static uint32_t sched_start = 0;
+    static uint8_t  sched_valid = 0;
+    if (sched_valid && sched_start == half_start) return;
+    sched_start = half_start;
+    sched_valid = 1;
+
     /* ---- CH2 (iron) ---- */
     if (ch2_fullon) {
         HAL_GPIO_WritePin(CH2_GPIO_Port, CH2_Pin, GPIO_PIN_SET);
@@ -129,14 +209,24 @@ static void schedule_half(void) {
         HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_RESET);
         armed1    = 0;
         gate1_off = 0;
-        if (heater_pct) {
-            uint32_t delay = RmsDelayTicks(heater_pct);
-            if (delay == 0) {
-                HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
-                gate1_off = dim_tick + GATE_PULSE_TICKS;
+        if (heater_dq) {
+            if (heater_dq < HEATER_BURST_MAX_DQ) {
+                /* burst mode: fire whole half-cycles at the zero-cross */
+                heat_burst_acc += heater_dq;
+                if (heat_burst_acc >= 10000u) {
+                    heat_burst_acc -= 10000u;
+                    HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
+                    gate1_off = dim_tick + BURST_GATE_TICKS;
+                }
             } else {
-                fire1  = dim_tick + delay;
-                armed1 = 1;
+                uint32_t delay = HeaterDelayTicks();
+                if (delay == 0) {
+                    HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
+                    gate1_off = gate_end(dim_tick);
+                } else {
+                    fire1  = dim_tick + delay;
+                    armed1 = 1;
+                }
             }
         }
     }
@@ -151,8 +241,9 @@ void Dimmer_Init(void) {
     half_start   = 0;
     last_zc_tick = 0;
     synced       = 0;
-    heater_pct   = 0;
+    heater_dq    = 0;
     iron_pct     = 0;
+    heat_dither  = 0;
     fire1 = fire2 = 0;
     armed1 = armed2 = 0;
     gate1_off = gate2_off = 0;
@@ -162,14 +253,23 @@ void Dimmer_Init(void) {
 
 void Dimmer_SetHeater(uint8_t percent) {
     if (percent > 100) percent = 100;
+    Dimmer_SetHeaterFine((float)percent);
+}
+
+void Dimmer_SetHeaterFine(float percent) {
+    if (percent < 0.0f) percent = 0.0f;
+    if (percent > 100.0f) percent = 100.0f;
+    uint16_t dq = (uint16_t)(percent * 100.0f + 0.5f);
+    if (dq > 10000u) dq = 10000u;
 
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    heater_pct = percent;
+    heater_dq = dq;
+    if (dq == 0) heat_burst_acc = 0;
 
     /* Enter or leave full-on mode immediately so the gate state is correct
      * even between zero-cross events. */
-    if (percent >= HEATER_FULLON_PCT) {
+    if (dq >= HEATER_FULLON_PCT * 100u) {
         if (!ch1_fullon) {
             ch1_fullon = 1;
             armed1    = 0;
@@ -204,7 +304,7 @@ void Dimmer_SetIron(uint8_t percent) {
     __set_PRIMASK(primask);
 }
 
-uint8_t Dimmer_GetHeater(void) { return heater_pct; }
+uint8_t Dimmer_GetHeater(void) { return (uint8_t)((heater_dq + 50u) / 100u); }
 uint8_t Dimmer_GetIron(void)   { return iron_pct;   }
 
 uint8_t Dimmer_ZcOk(void) {
@@ -247,7 +347,7 @@ void Dimmer_TickISR(void) {
     /* CH1 phase-control: fire when delay expires */
     if (armed1 && dim_tick >= fire1) {
         HAL_GPIO_WritePin(CH1_GPIO_Port, CH1_Pin, GPIO_PIN_SET);
-        gate1_off = dim_tick + GATE_PULSE_TICKS;
+        gate1_off = gate_end(dim_tick);
         armed1 = 0;
     }
     /* CH2 phase-control: fire when delay expires */
